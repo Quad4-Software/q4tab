@@ -23,7 +23,17 @@
         "q4complete.serverPath": {
           "type": "string",
           "default": "q4complete",
-          "description": "Path to the q4complete server binary"
+          "description": "Path to the q4complete server binary or its containing directory. Default resolves the bundled binary, then PATH. Ignored when serverAddr is set."
+        },
+        "q4complete.serverAddr": {
+          "type": "string",
+          "default": "",
+          "description": "Remote server address host:port (deploy with 'q4complete serve -listen host:7917'). Empty = spawn the local binary over stdio."
+        },
+        "q4complete.serverToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for a remote server started with -token. Sent as q4/auth after connect."
         },
         "q4complete.modelPath": {
           "type": "string",
@@ -39,20 +49,56 @@
           "type": "number",
           "default": 4,
           "description": "Maximum inline completion candidates to request"
+        },
+        "q4complete.requestTimeout": {
+          "type": "number",
+          "default": 1000,
+          "description": "Milliseconds to wait for a completion before giving up"
         }
       }
     },
     "commands": [
       {
         "command": "q4complete.status",
-        "title": "q4complete: Show model stats"
+        "title": "q4complete: Show Status"
+      },
+      {
+        "command": "q4complete.restart",
+        "title": "q4complete: Restart Server"
+      },
+      {
+        "command": "q4complete.toggle",
+        "title": "q4complete: Toggle Completions"
+      },
+      {
+        "command": "q4complete.indexWorkspace",
+        "title": "q4complete: Index Workspace"
+      },
+      {
+        "command": "q4complete.trigger",
+        "title": "q4complete: Trigger Suggestion"
+      },
+      {
+        "command": "q4complete.openLog",
+        "title": "q4complete: Show Log"
+      },
+      {
+        "command": "q4complete.menu",
+        "title": "q4complete: Menu"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "q4complete.trigger",
+        "key": "alt+\\",
+        "when": "editorTextFocus && !editorReadonly"
       }
     ]
   },
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "typecheck": "tsc --noEmit",
-    "package": "vsce package --no-dependencies"
+    "package": "npm run build && mkdir -p bin && cp ../bin/q4complete bin/ && vsce package --no-dependencies"
   },
   "dependencies": {
     "vscode-languageclient": "^10.1.1"
