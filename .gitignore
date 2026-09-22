@@ -3,3 +3,6 @@ out/
 node_modules/
 *.vsix
 *.bin
+engine.test
+testdata/*.jsonl
+testdata/*.out
