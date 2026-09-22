@@ -1,0 +1,67 @@
+{
+  "name": "q4complete",
+  "displayName": "q4complete",
+  "description": "Fully local statistical code completion trained on your codebase. No cloud, no LLM, no GPU.",
+  "version": "0.1.0",
+  "publisher": "quad4",
+  "license": "0BSD",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Snippets"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "q4complete",
+      "properties": {
+        "q4complete.serverPath": {
+          "type": "string",
+          "default": "q4complete",
+          "description": "Path to the q4complete server binary"
+        },
+        "q4complete.modelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the trained model file (empty = default ~/.local/share/q4complete/model.bin)"
+        },
+        "q4complete.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline completions"
+        },
+        "q4complete.maxSuggestions": {
+          "type": "number",
+          "default": 4,
+          "description": "Maximum inline completion candidates to request"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "q4complete.status",
+        "title": "q4complete: Show model stats"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
