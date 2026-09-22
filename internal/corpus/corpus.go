@@ -1,6 +1,6 @@
 // Package corpus walks source trees and yields clean, deduped source files
 // for model training. It prefers `git ls-files` so .gitignore is respected
-// and only tracked files are indexed; it falls back to a filesystem walk.
+// and only tracked files are indexed. It falls back to a filesystem walk.
 package corpus
 
 import (
@@ -51,9 +51,11 @@ const (
 
 // File is one source file from the corpus.
 type File struct {
-	Path string
-	Repo string // top-level directory name that contained it
-	Data []byte
+	Path    string
+	Repo    string // top-level directory name that contained it
+	Data    []byte
+	Size    int64 // bytes on disk
+	ModTime int64 // source mtime, unix seconds
 }
 
 func looksBinary(data []byte) bool {
@@ -92,8 +94,13 @@ func hasLongLines(data []byte) bool {
 			}
 		}
 	}
-	return false
+	// The final line may have no trailing newline.
+	return len(data)-start > maxLineLen
 }
+
+// Accept reports whether data from path is indexable source. Exposed for
+// the incremental indexer, which reads only changed files.
+func Accept(path string, data []byte) bool { return accept(path, data) }
 
 func accept(path string, data []byte) bool {
 	ext := strings.ToLower(filepath.Ext(path))
@@ -159,6 +166,77 @@ func walkFiles(root string) []string {
 	return rel
 }
 
+// repoPaths lists candidate file paths under root, honoring git ls-files
+// when the root is a repo and the skip-dir rules either way.
+func repoPaths(root string) []string {
+	var rels []string
+	if r, ok := gitFiles(root); ok {
+		rels = r
+	} else {
+		rels = walkFiles(root)
+	}
+	sort.Strings(rels)
+	out := rels[:0]
+	for _, rel := range rels {
+		// Skip nested skip-dirs even when git lists them (vendor etc).
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		skip := false
+		for _, p := range parts[:len(parts)-1] {
+			if skipDirs[p] {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+// ListFiles stats every acceptable-looking path under roots without
+// reading contents. It feeds the incremental indexer, which diffs the
+// result against the manifest. Binary/generated checks need content and
+// run later, only on files that changed.
+func ListFiles(roots []string) []File {
+	var out []File
+	for _, root := range roots {
+		root, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		repoName := filepath.Base(root)
+		for _, rel := range repoPaths(root) {
+			full := filepath.Join(root, rel)
+			ext := strings.ToLower(filepath.Ext(rel))
+			if skipExt[ext] {
+				continue
+			}
+			name := strings.ToLower(filepath.Base(rel))
+			skip := false
+			for suf := range skipExt {
+				if strings.HasSuffix(name, suf) {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+			fi, err := os.Stat(full)
+			if err != nil || fi.Size() == 0 || fi.Size() > maxFileSize {
+				continue
+			}
+			out = append(out, File{Path: full, Repo: repoName, Size: fi.Size(), ModTime: fi.ModTime().Unix()})
+		}
+	}
+	return out
+}
+
 // Collect gathers acceptable files under each root. Each root may be a
 // single repo or a directory containing repos.
 func Collect(roots []string, out chan<- File) error {
@@ -173,25 +251,12 @@ func Collect(roots []string, out chan<- File) error {
 			continue
 		}
 		repoName := filepath.Base(root)
-		var rels []string
-		if r, ok := gitFiles(root); ok {
-			rels = r
-		} else {
-			rels = walkFiles(root)
-		}
-		sort.Strings(rels)
-		for _, rel := range rels {
+		for _, rel := range repoPaths(root) {
 			full := filepath.Join(root, rel)
-			// Skip nested skip-dirs even when git lists them (vendor etc).
-			parts := strings.Split(filepath.ToSlash(rel), "/")
-			skip := false
-			for _, p := range parts[:len(parts)-1] {
-				if skipDirs[p] {
-					skip = true
-					break
-				}
-			}
-			if skip {
+			// Stat first so multi-GB tracked files are skipped without
+			// being read into memory.
+			fi, err := os.Stat(full)
+			if err != nil || fi.Size() == 0 || fi.Size() > maxFileSize {
 				continue
 			}
 			data, err := os.ReadFile(full)
@@ -201,7 +266,7 @@ func Collect(roots []string, out chan<- File) error {
 			if !accept(rel, data) {
 				continue
 			}
-			out <- File{Path: full, Repo: repoName, Data: data}
+			out <- File{Path: full, Repo: repoName, Data: data, Size: fi.Size(), ModTime: fi.ModTime().Unix()}
 		}
 	}
 	return nil

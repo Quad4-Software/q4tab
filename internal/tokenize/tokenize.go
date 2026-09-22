@@ -14,7 +14,7 @@ const (
 	EOF = "<eof>"
 	UNK = "<unk>"
 	WS  = " "
-	BOL = "" // never emitted; zero value guard
+	BOL = "" // never emitted. Zero value guard
 )
 
 func isIdentStart(c byte) bool {
@@ -34,7 +34,7 @@ var multiOps = []string{
 	"...", "<<=", ">>=", "**=",
 	"==", "!=", "<=", ">=", "->", "=>", "::", "&&", "||",
 	"+=", "-=", "*=", "/=", "%=", "++", "--", "<<", ">>",
-	"<-", ":=", "**", "&=", "|=", "^=", "??", "?.", "=>",
+	"<-", ":=", "**", "&=", "|=", "^=", "??", "?.",
 }
 
 func matchOp(src []byte, i int) string {
@@ -113,6 +113,9 @@ func Lex(src []byte) []string {
 			for j < n {
 				if src[j] == '\\' {
 					j += 2
+					if j > n {
+						j = n
+					}
 					continue
 				}
 				if src[j] == c {

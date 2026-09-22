@@ -66,3 +66,27 @@ func TestDetokRoundTrip(t *testing.T) {
 		t.Fatalf("round trip failed: %q", Detok(toks))
 	}
 }
+
+// TestLexTruncatedEscape covers the panic where a backslash at EOF
+// overshot the string scan.
+func TestLexTruncatedEscape(t *testing.T) {
+	for _, src := range []string{`"a\`, `x = "ab\`, "'\\", "`\\", `"`} {
+		got := Lex([]byte(src))
+		if len(got) == 0 || got[len(got)-1] != EOF {
+			t.Fatalf("bad tokens for %q: %q", src, got)
+		}
+	}
+}
+
+// FuzzLex must never panic and always end with EOF.
+func FuzzLex(f *testing.F) {
+	f.Add(`x = "a\"b"` + "\nif err != nil {\n\treturn err\n}\n")
+	f.Add("a\t\tb /* c */ d // e\n")
+	f.Add("`raw\\`str`\n")
+	f.Fuzz(func(t *testing.T, src string) {
+		got := Lex([]byte(src))
+		if len(got) == 0 || got[len(got)-1] != EOF {
+			t.Fatalf("no EOF for %q", src)
+		}
+	})
+}

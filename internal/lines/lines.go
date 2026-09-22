@@ -3,17 +3,34 @@
 // text the user has typed on the current line, it finds corpus lines that
 // begin the same way and proposes their continuations, ranked by how
 // often each continuation was seen.
+//
+// The index stores keys as a packed byte blob plus offsets rather than
+// a []string: no per-string header overhead, and the blob can be an
+// mmap'd region so untouched pages never become resident.
 package lines
 
 import (
 	"sort"
 	"strings"
+	"unsafe"
 )
 
-// Index is a static sorted line index.
+// Index is a static sorted line index. Keys live in Blob: key i is
+// Blob[Off[i]:Off[i+1]]. Keys are sorted lexicographically.
 type Index struct {
-	Keys []string // normalized lines, sorted
+	Blob []byte
+	Off  []uint32 // len = key count + 1
 	Cnts []int32  // occurrence count per key
+}
+
+// Key returns the i-th normalized line without copying. Safe because
+// the blob is never mutated after construction (mapped or not).
+func (idx *Index) Key(i int) string {
+	lo, hi := idx.Off[i], idx.Off[i+1]
+	if lo == hi {
+		return ""
+	}
+	return unsafe.String(&idx.Blob[lo], int(hi-lo))
 }
 
 // Normalize collapses whitespace runs and trims leading whitespace so
@@ -28,7 +45,7 @@ func Normalize(s string) string {
 	ws := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == ' ' || c == '\t' {
+		if c == ' ' || c == '\t' || c == '\r' {
 			ws = true
 			continue
 		}
@@ -82,10 +99,15 @@ func (b *Builder) Compact() *Index {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	idx := &Index{Keys: keys, Cnts: make([]int32, len(keys))}
+	idx := &Index{Off: make([]uint32, len(keys)+1), Cnts: make([]int32, len(keys))}
+	var blob []byte
 	for i, k := range keys {
+		idx.Off[i] = uint32(len(blob))
+		blob = append(blob, k...)
 		idx.Cnts[i] = b.counts[k]
 	}
+	idx.Off[len(keys)] = uint32(len(blob))
+	idx.Blob = blob
 	return idx
 }
 
@@ -101,50 +123,70 @@ type Continuation struct {
 // entries examined (a broad prefix like "return " can match millions).
 func (idx *Index) Complete(prefix string, limit, scanCap int) []Continuation {
 	norm := Normalize(prefix)
-	if len(norm) < 2 {
+	if len(norm) < 2 || limit <= 0 {
 		return nil
 	}
-	lo := sort.SearchStrings(idx.Keys, norm)
-	if lo >= len(idx.Keys) {
+	lo := sort.Search(len(idx.Cnts), func(i int) bool { return idx.Key(i) >= norm })
+	if lo >= len(idx.Cnts) {
 		return nil
 	}
-	conts := make(map[string]int)
+	// Keys sharing the prefix sort by their remainder, so identical
+	// rests are adjacent: group them in one pass and keep only the
+	// best `limit` (count desc, rest asc). No map, no full sort.
+	tops := make([]Continuation, 0, limit+1)
+	push := func(rest string, cnt int) {
+		// Insertion into a small descending slice. Rests arrive in
+		// ascending order so equal counts never need to move earlier
+		// entries.
+		i := len(tops)
+		for i > 0 && tops[i-1].Count < cnt {
+			i--
+		}
+		if i == limit {
+			return
+		}
+		tops = append(tops, Continuation{})
+		copy(tops[i+1:], tops[i:])
+		tops[i] = Continuation{Text: rest, Count: cnt}
+		if len(tops) > limit {
+			tops = tops[:limit]
+		}
+	}
+	var last string
+	var lastCnt int
 	examined := 0
-	for i := lo; i < len(idx.Keys) && examined < scanCap; i++ {
-		k := idx.Keys[i]
+	for i := lo; i < len(idx.Cnts) && examined < scanCap; i++ {
+		k := idx.Key(i)
 		if !strings.HasPrefix(k, norm) {
 			break
 		}
 		examined++
 		rest := k[len(norm):]
-		if rest == "" {
+		if rest == last {
+			lastCnt += int(idx.Cnts[i])
 			continue
 		}
-		// Only propose continuations that extend the prefix by a
-		// meaningful amount.
-		if len(rest) < 2 {
-			continue
+		if len(last) >= 2 {
+			push(last, lastCnt)
 		}
-		conts[rest] += int(idx.Cnts[i])
+		last, lastCnt = rest, int(idx.Cnts[i])
 	}
-	if len(conts) == 0 {
-		return nil
+	if len(last) >= 2 {
+		push(last, lastCnt)
 	}
-	out := make([]Continuation, 0, len(conts))
-	for t, c := range conts {
-		out = append(out, Continuation{Text: t, Count: c})
+	return tops
+}
+
+// HasPrefix reports whether any indexed line starts with p. p must
+// already be normalized. Used by the fill-in-the-middle check to verify
+// that a suggestion splices cleanly into existing text after the cursor.
+func (idx *Index) HasPrefix(p string) bool {
+	if p == "" {
+		return false
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
-		}
-		return out[i].Text < out[j].Text
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out
+	i := sort.Search(len(idx.Cnts), func(i int) bool { return idx.Key(i) >= p })
+	return i < len(idx.Cnts) && strings.HasPrefix(idx.Key(i), p)
 }
 
 // Len returns the number of unique lines.
-func (idx *Index) Len() int { return len(idx.Keys) }
+func (idx *Index) Len() int { return len(idx.Cnts) }

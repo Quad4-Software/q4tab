@@ -1,13 +1,21 @@
 package model
 
-import "sort"
+import (
+	"sort"
+	"sync"
+)
 
 // Cache is a small dynamic n-gram model fed from open/edited files.
 // It captures the locality of software: identifiers and patterns from the
 // file you are editing should dominate suggestions. It mixes with the
 // static model at query time via Jelinek-Mercer interpolation, with the
 // cache weight growing as the cache sees the context more often.
+//
+// Safe for concurrent use: Add takes the write lock, Dist the read lock.
+// Callers that swap the *Cache pointer itself still need their own
+// synchronization.
 type Cache struct {
+	mu     sync.RWMutex
 	order  int
 	rows   []map[uint64]map[uint32]uint32 // index k: ctx(k-1 toks) -> tok -> count
 	totals []map[uint64]uint32
@@ -26,6 +34,8 @@ func NewCache(order int) *Cache {
 
 // Add counts n-grams in the token sequence. eofTok contexts are skipped.
 func (c *Cache) Add(ids []uint32, eofTok uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for i := 0; i < len(ids); i++ {
 		tok := ids[i]
 		if tok == eofTok {
@@ -64,6 +74,8 @@ func (c *Cache) Add(ids []uint32, eofTok uint32) {
 // The second return value is the total count of the winning context row,
 // used to derive the interpolation weight.
 func (c *Cache) Dist(ctx []uint32) (map[uint32]float64, float64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for k := c.order; k >= 1; k-- {
 		var useCtx []uint32
 		if k > 1 {
