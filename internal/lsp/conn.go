@@ -7,6 +7,7 @@ package lsp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -52,8 +53,16 @@ func (c *Conn) Read() (*Message, error) {
 			}
 		}
 	}
-	if length < 0 || length > 1<<26 {
-		return nil, fmt.Errorf("bad frame length %d", length)
+	if length < 0 {
+		return nil, fmt.Errorf("missing Content-Length")
+	}
+	if length > 1<<26 {
+		// Oversized but length-delimited: discard the body so the
+		// stream stays in sync, then let the caller skip it.
+		if _, err := io.CopyN(io.Discard, c.r, int64(length)); err != nil {
+			return nil, err
+		}
+		return nil, ErrOversized
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(c.r, buf); err != nil {
@@ -61,10 +70,18 @@ func (c *Conn) Read() (*Message, error) {
 	}
 	var m Message
 	if err := json.Unmarshal(buf, &m); err != nil {
-		return nil, err
+		// The frame was consumed. A bad body is skippable.
+		return nil, fmt.Errorf("%w: %v", ErrBadFrame, err)
 	}
 	return &m, nil
 }
+
+// ErrOversized marks a frame that was discarded for exceeding the size
+// cap. The stream remains synchronized.
+var ErrOversized = errors.New("frame exceeds size cap")
+
+// ErrBadFrame marks a consumed frame whose body did not parse.
+var ErrBadFrame = errors.New("bad frame body")
 
 func (c *Conn) write(v any) error {
 	data, err := json.Marshal(v)

@@ -85,6 +85,7 @@ func TestEngineCacheLocality(t *testing.T) {
 	// The open doc invents a new identifier the corpus never had.
 	doc := "package x\n\nvar quadrilateralChannelCounter int\n"
 	e.UpdateDoc("file:///x.go", doc)
+	e.Flush()
 	// Later in the same file the model should prefer it.
 	text := doc + "\nfunc bump() {\n\tquadrilateralCha"
 	items := e.Complete("file:///x.go", text, len(text))
@@ -217,5 +218,165 @@ func TestLSPEndToEnd(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no useful inline completion: %+v", list.Items)
+	}
+}
+
+func TestIncrementalDidChange(t *testing.T) {
+	e := buildTestEngine(t)
+	srvIn, cliIn := io.Pipe()
+	cliOut, srvOut := io.Pipe()
+	srv := NewServer(e, NewConn(srvIn, srvOut))
+	go srv.Run()
+	time.Sleep(10 * time.Millisecond)
+	cli := &rpcClient{w: cliIn, r: bufio.NewReader(cliOut)}
+	if _, err := cli.call("initialize", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	doc := "package x\n\nfunc f() int {\n\treturn 1\n}\n"
+	cli.notify("textDocument/didOpen", DidOpenTextDocumentParams{
+		TextDocument: TextDocumentItem{
+			URI: "file:///x.go", LanguageID: "go", Version: 1, Text: doc,
+		},
+	})
+	time.Sleep(10 * time.Millisecond)
+	// docText synchronized via a request round-trip: the server
+	// processes messages in order, so after the response the preceding
+	// notify has been applied and the pipe gives a happens-before edge.
+	docText := func() string {
+		if _, err := cli.call("q4/status", map[string]any{}); err != nil {
+			t.Fatal(err)
+		}
+		return srv.docs["file:///x.go"]
+	}
+	// Insert "2" before "1" on line 3: return 1 -> return 21.
+	cli.notify("textDocument/didChange", DidChangeTextDocumentParams{
+		TextDocument: VersionedTextDocumentIdentifier{URI: "file:///x.go", Version: 2},
+		ContentChanges: []TextDocumentContentChangeEvent{{
+			Range: &Range{Start: Position{Line: 3, Character: 8}, End: Position{Line: 3, Character: 8}},
+			Text:  "2",
+		}},
+	})
+	if got := docText(); !strings.Contains(got, "return 21") {
+		t.Fatalf("incremental edit not applied: %q", got)
+	}
+	// A ranged delete across two lines.
+	cli.notify("textDocument/didChange", DidChangeTextDocumentParams{
+		TextDocument: VersionedTextDocumentIdentifier{URI: "file:///x.go", Version: 3},
+		ContentChanges: []TextDocumentContentChangeEvent{{
+			Range: &Range{Start: Position{Line: 3, Character: 8}, End: Position{Line: 3, Character: 9}},
+			Text:  "",
+		}},
+	})
+	if got := docText(); !strings.Contains(got, "return 1") {
+		t.Fatalf("delete edit not applied: %q", got)
+	}
+	// Full-text change (Range nil) replaces the doc.
+	cli.notify("textDocument/didChange", DidChangeTextDocumentParams{
+		TextDocument:   VersionedTextDocumentIdentifier{URI: "file:///x.go", Version: 4},
+		ContentChanges: []TextDocumentContentChangeEvent{{Text: "package x\n"}},
+	})
+	if got := docText(); got != "package x\n" {
+		t.Fatalf("full replace failed: %q", got)
+	}
+}
+
+func TestReindex(t *testing.T) {
+	e := buildTestEngine(t)
+	srvIn, cliIn := io.Pipe()
+	cliOut, srvOut := io.Pipe()
+	srv := NewServer(e, NewConn(srvIn, srvOut))
+	go srv.Run()
+	time.Sleep(10 * time.Millisecond)
+	cli := &rpcClient{w: cliIn, r: bufio.NewReader(cliOut)}
+
+	// Missing delta file is not an error: it means no changes.
+	delta := filepath.Join(t.TempDir(), "model.bin.delta")
+	srv.SetDeltaPath(delta)
+	res, err := cli.call("q4/reindex", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r struct {
+		Files int `json:"files"`
+	}
+	if err := json.Unmarshal(res, &r); err != nil || r.Files != 0 {
+		t.Fatalf("reindex empty: %v %+v", err, r)
+	}
+
+	// A real delta installs its lines into the engine.
+	if err := engine.SaveDelta(delta, []engine.DeltaFile{{
+		Path: "x.go", ModTime: 1,
+		Data: []byte("func reindexedMarker() int {\n\treturn 42\n}\n"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = cli.call("q4/reindex", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(res, &r); err != nil || r.Files != 1 {
+		t.Fatalf("reindex 1 file: %v %+v", err, r)
+	}
+	if e.Stats()["delta"].(int) != 1 || e.Stats()["deltaTok"].(int) == 0 {
+		t.Fatalf("delta not installed: %v", e.Stats())
+	}
+
+	// Removing the delta file then reindexing clears the overlay.
+	os.Remove(delta)
+	if _, err := cli.call("q4/reindex", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if e.Stats()["delta"].(int) != 0 {
+		t.Fatalf("delta not cleared: %v", e.Stats())
+	}
+}
+
+func TestOffsetAt(t *testing.T) {
+	// UTF-16 units: BMP = 1, astral = 2.
+	text := "ab\U0001F600cd\nef"
+	if got := offsetAt(text, Position{Line: 0, Character: 3}); got != 6 {
+		// 'a','b',emoji(2 units) -> col 3 lands right after the emoji
+		t.Fatalf("astral offset = %d, want 6", got)
+	}
+	if got := offsetAt(text, Position{Line: 1, Character: 1}); got != 10 {
+		t.Fatalf("line 1 col 1 = %d, want 10", got)
+	}
+	// CRLF: the \r is not part of the line's columns.
+	crlf := "ab\r\ncd"
+	if got := offsetAt(crlf, Position{Line: 0, Character: 5}); got != 2 {
+		t.Fatalf("CRLF clamp = %d, want 2", got)
+	}
+	if got := offsetAt(crlf, Position{Line: 1, Character: 1}); got != 5 {
+		t.Fatalf("CRLF line1 = %d, want 5", got)
+	}
+	// Past end of document clamps.
+	if got := offsetAt(text, Position{Line: 99, Character: 0}); got != len(text) {
+		t.Fatalf("past-end = %d, want %d", got, len(text))
+	}
+	// Truncated UTF-8 must not skip past a newline.
+	bad := "a\xff\nb"
+	if got := offsetAt(bad, Position{Line: 0, Character: 5}); got != 2 {
+		t.Fatalf("bad utf8 clamp = %d, want 2", got)
+	}
+}
+
+func TestOversizedFrameSkipped(t *testing.T) {
+	e := buildTestEngine(t)
+	srvIn, cliIn := io.Pipe()
+	cliOut, srvOut := io.Pipe()
+	srv := NewServer(e, NewConn(srvIn, srvOut))
+	go srv.Run()
+	time.Sleep(10 * time.Millisecond)
+	cli := &rpcClient{w: cliIn, r: bufio.NewReader(cliOut)}
+	// A frame over the 64 MiB cap must be discarded, not fatal.
+	huge := make([]byte, 1<<26+1)
+	fmt.Fprintf(cliIn, "Content-Length: %d\r\n\r\n", len(huge))
+	cliIn.Write(huge)
+	res, err := cli.call("initialize", map[string]any{})
+	if err != nil {
+		t.Fatalf("server died after oversized frame: %v", err)
+	}
+	if res == nil {
+		t.Fatal("no initialize response")
 	}
 }

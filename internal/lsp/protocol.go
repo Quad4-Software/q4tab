@@ -1,5 +1,7 @@
 package lsp
 
+import "unicode/utf8"
+
 // Minimal LSP type subset (LSP 3.18).
 
 type Position struct {
@@ -63,9 +65,10 @@ type InlineCompletionParams struct {
 }
 
 type InlineCompletionItem struct {
-	InsertText string `json:"insertText"`
-	Range      *Range `json:"range,omitempty"`
-	FilterText string `json:"filterText,omitempty"`
+	InsertText string   `json:"insertText"`
+	Range      *Range   `json:"range,omitempty"`
+	FilterText string   `json:"filterText,omitempty"`
+	Command    *Command `json:"command,omitempty"`
 }
 
 type InlineCompletionList struct {
@@ -89,9 +92,17 @@ type CompletionList struct {
 	Items        []CompletionItem `json:"items"`
 }
 
-// Offset converts an LSP position to a byte offset in text. LSP positions
-// are UTF-16 code units; for the ASCII-dominant corpus this is exact, and
-// for non-ASCII lines we fall back gracefully.
+// Command is the LSP command attached to an accepted completion.
+type Command struct {
+	Title     string `json:"title"`
+	Command   string `json:"command"`
+	Arguments []any  `json:"arguments,omitempty"`
+}
+
+// offsetAt converts an LSP position to a byte offset in text. LSP
+// positions are UTF-16 code units: BMP runes count as one unit, others
+// as two. We walk runes and accumulate units, so non-ASCII columns land
+// correctly.
 func offsetAt(text string, p Position) int {
 	line := 0
 	i := 0
@@ -101,12 +112,24 @@ func offsetAt(text string, p Position) int {
 		}
 		i++
 	}
-	// Walk character units; treat bytes as chars (approximation for
-	// non-ASCII, correct for ASCII).
 	col := 0
-	for i < len(text) && text[i] != '\n' && col < p.Character {
-		i++
-		col++
+	for i < len(text) && text[i] != '\n' {
+		if col >= p.Character {
+			break
+		}
+		// CRLF: the carriage return is not part of the line's content,
+		// so a position past end-of-line clamps before it.
+		if text[i] == '\r' && i+1 < len(text) && text[i+1] == '\n' {
+			break
+		}
+		// UTF-16 columns: astral runes count as two code units.
+		r, w := utf8.DecodeRuneInString(text[i:])
+		i += w
+		if r > 0xFFFF {
+			col += 2
+		} else {
+			col++
+		}
 	}
 	return i
 }
