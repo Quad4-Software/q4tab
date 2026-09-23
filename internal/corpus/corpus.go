@@ -5,6 +5,7 @@ package corpus
 
 import (
 	"bytes"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -24,15 +25,27 @@ var skipDirs = map[string]bool{
 }
 
 var skipExt = map[string]bool{
-	".min.js": true, ".lock": true, ".sum": true,
+	".min.js": true, ".min.css": true, ".lock": true, ".sum": true,
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
 	".ico": true, ".woff": true, ".woff2": true, ".ttf": true,
 	".zip": true, ".tar": true, ".gz": true, ".xz": true,
 	".pdf": true, ".so": true, ".dll": true, ".exe": true,
 	".bin": true, ".wasm": true, ".map": true, ".snap": true,
-	".pb.go": true, ".generated.go": true, ".g.dart": true,
+	".pb.go": true, ".gen.go": true, ".generated.go": true,
+	".g.dart": true, ".designer.cs": true,
 	".svg": true, ".mp3": true, ".mp4": true, ".webm": true,
 	".webp": true, ".jar": true, ".class": true, ".o": true,
+}
+
+// skipFiles holds exact basenames with no learnable code. The .lock
+// and .sum suffixes already catch most of these; the map also covers
+// names like package-lock.json and pnpm-lock.yaml whose extensions
+// real sources share.
+var skipFiles = map[string]bool{
+	"package-lock.json": true, "yarn.lock": true,
+	"pnpm-lock.yaml": true, "cargo.lock": true,
+	"go.sum": true, "composer.lock": true,
+	"gemfile.lock": true, "poetry.lock": true,
 }
 
 var generatedMarkers = [][]byte{
@@ -54,8 +67,9 @@ type File struct {
 	Path    string
 	Repo    string // top-level directory name that contained it
 	Data    []byte
-	Size    int64 // bytes on disk
-	ModTime int64 // source mtime, unix seconds
+	Size    int64  // bytes on disk
+	ModTime int64  // source mtime, unix seconds
+	DupOf   string // path of the first file seen with identical content
 }
 
 func looksBinary(data []byte) bool {
@@ -102,17 +116,27 @@ func hasLongLines(data []byte) bool {
 // the incremental indexer, which reads only changed files.
 func Accept(path string, data []byte) bool { return accept(path, data) }
 
-func accept(path string, data []byte) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	if skipExt[ext] {
-		return false
+// skipName reports whether a lowercased basename is skippable by name
+// alone: lock files, minified bundles, or generated code. The suffix
+// pass also covers single extensions like .png.
+func skipName(name string) bool {
+	if skipFiles[name] {
+		return true
 	}
-	// Double extensions like .min.js
-	name := strings.ToLower(filepath.Base(path))
+	if strings.Contains(name, "_generated.") {
+		return true
+	}
 	for suf := range skipExt {
 		if strings.HasSuffix(name, suf) {
-			return false
+			return true
 		}
+	}
+	return false
+}
+
+func accept(path string, data []byte) bool {
+	if skipName(strings.ToLower(filepath.Base(path))) {
+		return false
 	}
 	if len(data) == 0 || len(data) > maxFileSize {
 		return false
@@ -212,19 +236,7 @@ func ListFiles(roots []string) []File {
 		repoName := filepath.Base(root)
 		for _, rel := range repoPaths(root) {
 			full := filepath.Join(root, rel)
-			ext := strings.ToLower(filepath.Ext(rel))
-			if skipExt[ext] {
-				continue
-			}
-			name := strings.ToLower(filepath.Base(rel))
-			skip := false
-			for suf := range skipExt {
-				if strings.HasSuffix(name, suf) {
-					skip = true
-					break
-				}
-			}
-			if skip {
+			if skipName(strings.ToLower(filepath.Base(rel))) {
 				continue
 			}
 			fi, err := os.Stat(full)
@@ -238,9 +250,13 @@ func ListFiles(roots []string) []File {
 }
 
 // Collect gathers acceptable files under each root. Each root may be a
-// single repo or a directory containing repos.
+// single repo or a directory containing repos. Files whose content
+// repeats an earlier emission still arrive on the channel (manifests
+// need their paths) but with Data nil and DupOf set to the first-seen
+// path, so callers can count dups from the stream.
 func Collect(roots []string, out chan<- File) error {
 	defer close(out)
+	seen := make(map[uint64]string) // per-call content hashes
 	for _, root := range roots {
 		root, err := filepath.Abs(root)
 		if err != nil {
@@ -266,7 +282,16 @@ func Collect(roots []string, out chan<- File) error {
 			if !accept(rel, data) {
 				continue
 			}
-			out <- File{Path: full, Repo: repoName, Data: data, Size: fi.Size(), ModTime: fi.ModTime().Unix()}
+			f := File{Path: full, Repo: repoName, Size: fi.Size(), ModTime: fi.ModTime().Unix()}
+			h := fnv.New64a()
+			h.Write(data)
+			if first, dup := seen[h.Sum64()]; dup {
+				f.DupOf = first // Data stays nil, saving a copy
+			} else {
+				seen[h.Sum64()] = full
+				f.Data = data
+			}
+			out <- f
 		}
 	}
 	return nil
