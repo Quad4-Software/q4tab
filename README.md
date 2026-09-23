@@ -9,6 +9,8 @@ It learns as you type through per-file and session caches, and trained
 on your own repos it suggests your real internal APIs rather than
 generic ones.
 
+![q4tab in Neovim](assets/demo.gif)
+
 ## Install
 
 Tagged releases publish archives for linux, darwin, and windows on
