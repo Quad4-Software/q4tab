@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	pathpkg "path"
 	"runtime"
 	"sort"
 	"strings"
@@ -55,6 +56,8 @@ type Weights struct {
 	Struct float64 `json:"struct"` // structural-context vote on model candidates
 	Lang   float64 `json:"lang"`   // per-language table vote on model candidates
 	Sub    float64 `json:"sub"`    // synthesized identifier completion
+	Adapt  float64 `json:"adapt"`  // ident-rebound retrieval hit, plus raw count
+	Scope  float64 `json:"scope"`  // per in-scope identifier a candidate reuses
 
 	// Learned parameters persisted alongside the weights.
 	Cal  *Calibrator `json:"cal,omitempty"`  // journal-trained rank calibrator
@@ -66,6 +69,7 @@ func DefaultWeights() Weights {
 		File: 1e6, Dyn: 1e5, Learn: 2e5,
 		FIM: 4e6, FIMIdx: 3e6, Model: 1,
 		LineBi: 4e5, Struct: 2.0, Lang: 3.0, Sub: 3e5,
+		Adapt: 6e4, Scope: 3e4,
 	}
 }
 
@@ -143,12 +147,16 @@ type Engine struct {
 
 	// Auxiliary model layers from the v3 bundle. All optional; a nil
 	// field disables that layer cleanly.
-	lineBi *lines.GramIndex            // previous line(s) -> next line
-	struc  *model.Order                // lexical-context -> token counts
-	langs  map[string]*model.LangTable // per-language low-order tables
-	sub    *model.Model                // identifier subtoken model
-	idents *model.IdentIndex           // subtoken path -> ident ids
-	cal    *Calibrator                 // journal-trained rank calibrator
+	lineBi  *lines.GramIndex            // previous line(s) -> next line
+	struc   *model.Order                // lexical-context -> token counts
+	langs   map[string]*model.LangTable // per-language low-order tables
+	sub     *model.Model                // identifier subtoken model
+	idents  *model.IdentIndex           // subtoken path -> ident ids
+	cal     *Calibrator                 // journal-trained rank calibrator
+	mli     *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
+	fstarts map[string][]string         // lang -> common first lines of a file
+	dirIds  map[string][]string         // dir -> top idents (dir cache + import adjacency)
+	dirSuf  map[string][]string         // path suffix -> dirs, for import resolution
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -269,14 +277,6 @@ func (e *Engine) SetWeights(w Weights) {
 	e.mu.Unlock()
 }
 
-// SetCalibrator installs (or clears with nil) the journal-trained
-// rank calibrator applied at merge time.
-func (e *Engine) SetCalibrator(c *Calibrator) {
-	e.mu.Lock()
-	e.cal = c
-	e.mu.Unlock()
-}
-
 // bundle collects the installed model artifacts for saving. Callers
 // hold no lock; the fields it reads are write-once after SetBundle.
 func (e *Engine) bundle() *Bundle {
@@ -285,6 +285,7 @@ func (e *Engine) bundle() *Bundle {
 	return &Bundle{
 		M: e.m, Lines: e.li, LineBi: e.lineBi, Struct: e.struc,
 		Langs: e.langs, Sub: e.sub, Idents: e.idents,
+		FileStarts: e.fstarts, DirIdents: e.dirIds,
 	}
 }
 
@@ -299,18 +300,37 @@ func (e *Engine) SetBundle(b *Bundle) {
 	e.langs = b.Langs
 	e.sub = b.Sub
 	e.idents = b.Idents
+	e.fstarts = b.FileStarts
+	e.dirIds = b.DirIdents
+	e.dirSuf = buildDirSuf(b.DirIdents)
 }
 
-// SetModel installs the trained artifacts.
-func (e *Engine) SetModel(m *model.Model, li *lines.Index) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.setModelLocked(m, li)
+// buildDirSuf indexes directory paths by their last 1-3 segments so an
+// import path like "host/a/b/c" can resolve to a corpus dir ending in
+// "a/b/c", "b/c", or "c". Several dirs may share a suffix; the union
+// of their ident tables is what the import boost wants anyway.
+func buildDirSuf(ids map[string][]string) map[string][]string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(ids)*2)
+	for d := range ids {
+		segs := strings.Split(strings.Trim(d, "/"), "/")
+		for n := 1; n <= min(len(segs), 3); n++ {
+			tail := strings.Join(segs[len(segs)-n:], "/")
+			v := out[tail]
+			if len(v) < 8 {
+				out[tail] = append(v, d)
+			}
+		}
+	}
+	return out
 }
 
 func (e *Engine) setModelLocked(m *model.Model, li *lines.Index) {
 	e.m = m
 	e.li = li
+	e.mli = lines.BuildMaskedIndex(li)
 	if m != nil {
 		e.eofID, _ = m.Vocab.Lookup(tokenize.EOF)
 		e.nlID, _ = m.Vocab.Lookup(tokenize.NL)
@@ -404,8 +424,23 @@ func (e *Engine) loadJournalLocked() {
 		}
 		var rec struct {
 			Text string `json:"t"`
+			Ev   string `json:"e"`
+			Src  string `json:"s"`
 		}
-		if json.Unmarshal(line, &rec) != nil || rec.Text == "" {
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		// Accept/reject events rebuild the per-source counters so the
+		// learned source multiplier survives restarts.
+		switch rec.Ev {
+		case "a":
+			e.accN[rec.Src]++
+			continue
+		case "r":
+			e.rejN[rec.Src]++
+			continue
+		}
+		if rec.Text == "" {
 			continue
 		}
 		if e.m != nil {
@@ -1035,12 +1070,6 @@ func (e *Engine) Flush() {
 	}
 }
 
-// hasPending reports whether any doc is waiting on the builder.
-// Callers must hold e.dmu.
-func (e *Engine) hasPending() bool {
-	return len(e.pend) > 0
-}
-
 // docLines extracts normalized lines from document text.
 func docLines(text string) []string {
 	var out []string
@@ -1096,8 +1125,63 @@ type Item struct {
 	ReplaceToEOL bool
 }
 
+// isIdentStart reports whether c can start an identifier (no digits).
+func isIdentStart(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
+}
+
 func isIdentByte(c byte) bool {
 	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80
+}
+
+// Feature flags for A/B debugging:
+// Q4_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed
+const (
+	fAdapt = 1 << iota
+	fScope
+	fUnit
+	fCliff
+	fPrior
+	fHeal
+	fQual
+	fIter
+	fImp
+	fMMR
+	fSrc
+	fEmbed
+)
+
+func disabledFeatures() int {
+	var d int
+	for _, s := range strings.Split(os.Getenv("Q4_DISABLE"), ",") {
+		switch strings.TrimSpace(s) {
+		case "adapt":
+			d |= fAdapt
+		case "scope":
+			d |= fScope
+		case "unit":
+			d |= fUnit
+		case "cliff":
+			d |= fCliff
+		case "prior":
+			d |= fPrior
+		case "heal":
+			d |= fHeal
+		case "qual":
+			d |= fQual
+		case "iter":
+			d |= fIter
+		case "imp":
+			d |= fImp
+		case "mmr":
+			d |= fMMR
+		case "src":
+			d |= fSrc
+		case "embed":
+			d |= fEmbed
+		}
+	}
+	return d
 }
 
 // Complete returns ranked inline-completion texts for (text, offset).
@@ -1166,6 +1250,35 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 	}
 
 	exclude := lines.Normalize(curLine)
+
+	// Per-request feature switches for A/B debugging.
+	dis := disabledFeatures()
+
+	// Lex the prefix once: identifier set and frequency table for the
+	// in-scope boost, plus the thin-context check that decides whether
+	// file-start priors and structural priors get proposed.
+	scope, freq, thin := scopeInfo(prefix)
+
+	// The language governing priors and lang-table votes may differ
+	// from the file's extension: markdown fences and script blocks
+	// host embedded code.
+	lang := LangOf(uri)
+	if dis&fEmbed == 0 {
+		lang = docLang(lang, prefix)
+	}
+
+	// Candidate directories for the dir-level scope union: the file's
+	// own dir plus its import paths. Pure request state, so the
+	// extraction runs outside the lock.
+	var scopeCands []string
+	if dis&fImp == 0 {
+		scopeCands = importCands(prefix, fileDir(uri))
+	}
+	if dis&fScope != 0 {
+		scope = nil
+		freq = nil
+	}
+
 	// The gather/generate/post-pass path only reads engine state, so
 	// it runs under the read lock: many clients complete in parallel.
 	// Caches and the vocab carry their own internal locks.
@@ -1174,11 +1287,48 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		defer e.mu.RUnlock()
 		w := e.w
 
+		// Directory-level and import-adjacency scope: names frequent
+		// in this directory and in directories matching the file's
+		// imports count as in-scope even before they appear here.
+		// They are tracked separately from doc-declared names: the
+		// prior is weaker than evidence from the file itself, and a
+		// full-strength boost on every directory name saturates the
+		// ranking signal.
+		var dirScope map[string]bool
+		if scope != nil {
+			for _, d := range e.resolveDirs(scopeCands) {
+				for _, s := range e.dirIds[d] {
+					if _, ok := scope[s]; !ok {
+						scope[s] = true
+						freq[s] = 1
+						if dirScope == nil {
+							dirScope = map[string]bool{}
+						}
+						dirScope[s] = true
+					}
+				}
+			}
+		}
+
+		verbatimHit := false
 		if len(text) <= e.cfg.MaxDocSize {
 			for _, c := range fileLines(text, linePrefix, exclude, curLineIdx, 3) {
 				if ok := e.accept(c, ns, restN); ok && !seen[c] {
 					seen[c] = true
+					verbatimHit = true
 					items = append(items, mk(c, "file", w.File))
+				}
+			}
+			// The same file with caller's names rebound: repeats that
+			// renamed a variable still surface. Fallback only — when a
+			// verbatim line matched, the names already agree and
+			// rebinding just competes with it.
+			if dis&fAdapt == 0 && !verbatimHit {
+				for _, c := range fileAdaptLines(text, linePrefix, exclude, curLineIdx, 3) {
+					if ok := e.accept(c, ns, restN); ok && !seen[c] {
+						seen[c] = true
+						items = append(items, mk(c, "file+adapt", w.File*0.7))
+					}
 				}
 			}
 		}
@@ -1189,6 +1339,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			for _, c := range di.Complete(linePrefix, e.cfg.MaxItems*2, 4096) {
 				if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
 					seen[c.Text] = true
+					verbatimHit = true
 					items = append(items, mk(c.Text, "file", w.Dyn+float64(c.Count)))
 				}
 			}
@@ -1199,7 +1350,95 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			for _, c := range e.li.Complete(linePrefix, e.cfg.MaxItems*2, e.cfg.ScanCap) {
 				if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
 					seen[c.Text] = true
+					verbatimHit = true
 					items = append(items, mk(c.Text, "corpus", float64(c.Count)))
+				}
+			}
+		}
+
+		// Identifier-insensitive corpus retrieval: the same line shape
+		// with the caller's identifiers rebound into the continuation.
+		// Fallback only: a verbatim hit means names already agree, so
+		// adapted guesses would just compete with the true line.
+		if e.mli != nil && dis&fAdapt == 0 && !verbatimHit {
+			var vq *model.Query
+			var vctx []uint32
+			for _, c := range e.mli.Adapt(linePrefix, e.cfg.MaxItems, 64) {
+				if dis&fQual == 0 && c.Qual < 0.22 {
+					// The weakest shape matches are one- or two-token
+					// prefixes that rebound heavily: precision is too
+					// low to outrank model items.
+					continue
+				}
+				if e.m != nil {
+					// Model verification: a rebound line the n-gram
+					// finds implausible is adapt noise, not a hit.
+					if vq == nil {
+						vq = e.m.NewQuery()
+						vctx = lookupCtx(e.m, prefix)
+					}
+					if p := restProb(e.m, c.Text, vctx, vq); p < adaptMinProb {
+						continue
+					}
+				}
+				if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
+					seen[c.Text] = true
+					sc := w.Adapt + float64(c.Count)
+					if dis&fQual == 0 {
+						// Retrieval quality (Drozdov et al.): a more
+						// specific shape match earns a bonus on top of
+						// the flat score. Never a penalty: gated adapt
+						// hits are already high-precision, and scaling
+						// them down hands rank back to weaker model
+						// items.
+						sc += w.Adapt * 0.15 * c.Qual
+					}
+					items = append(items, mk(c.Text, "adapt", sc))
+				}
+			}
+		}
+
+		// Thin context: a fresh or nearly-empty file anchors nothing,
+		// so offer the language's conventional opening lines.
+		if thin && dis&fPrior == 0 {
+			for i, s := range e.fstarts[lang] {
+				if i >= 4 {
+					break
+				}
+				var c string
+				switch {
+				case linePrefix == "":
+					c = s
+				case strings.HasPrefix(s, linePrefix) && len(s) > len(linePrefix)+1:
+					c = s[len(linePrefix):]
+				default:
+					continue
+				}
+				if ok := e.accept(c, ns, restN); ok && !seen[c] {
+					seen[c] = true
+					items = append(items, mk(c, "prior", w.Dyn*0.9))
+				}
+			}
+			// Go files nearly always open with a package clause named
+			// for their directory.
+			if lang == "go" && curLineIdx == 0 {
+				if dir := fileDir(uri); dir != "" {
+					if name := goPkgName(dir); name != "" {
+						full := "package " + name
+						var c string
+						switch {
+						case linePrefix == "":
+							c = full
+						case strings.HasPrefix(full, linePrefix) && len(full) > len(linePrefix)+1:
+							c = full[len(linePrefix):]
+						}
+						if c != "" {
+							if ok := e.accept(c, ns, restN); ok && !seen[c] {
+								seen[c] = true
+								items = append(items, mk(c, "prior", w.File))
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1225,10 +1464,105 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			}
 		}
 
+		// Iterative retrieval (RepoCoder): feed the completed line
+		// back into the line-gram index so single-line hits grow a
+		// second attested line. Only the top two single-line items
+		// iterate: the pass exists to deepen strong candidates, not
+		// to multiply weak ones.
+		if dis&fIter == 0 && e.lineBi != nil && e.li != nil {
+			top := append([]Item(nil), items...)
+			sort.SliceStable(top, func(i, j int) bool { return top[i].Score > top[j].Score })
+			done := 0
+			for _, it := range top {
+				if done >= 2 || strings.IndexByte(it.Text, '\n') >= 0 {
+					continue
+				}
+				full := lines.Normalize(linePrefix + it.Text)
+				toks, cnts, tot := e.lineBi.Next(full)
+				if len(toks) == 0 || tot == 0 {
+					continue
+				}
+				indent := leadingWS(linePrefix)
+				v := it
+				v.Text = it.Text + "\n" + indent + e.li.Key(int(toks[0]))
+				v.Score = it.Score*0.5 + w.LineBi*0.5*float64(cnts[0])/float64(tot)
+				// A speculative second line must not outrank the
+				// confirmed first line it grew from.
+				if v.Score > it.Score*0.9 {
+					v.Score = it.Score * 0.9
+				}
+				v.Source = it.Source + "+iter"
+				if e.accept(v.Text, ns, restN) && !seen[v.Text] {
+					seen[v.Text] = true
+					items = append(items, v)
+					done++
+				}
+			}
+		}
+
+		// First-unit variants: a retrieved line sometimes carries
+		// extra attested tokens past the completed construct. Offer the
+		// head alone at a discount so the caller can take just it.
+		var extra []Item
+		if dis&fUnit == 0 {
+			for _, it := range items {
+				if strings.IndexByte(it.Text, '\n') >= 0 ||
+					strings.HasPrefix(it.Source, "model") {
+					continue
+				}
+				if head, ok := firstUnit(it.Text); ok && !seen[head] && e.accept(head, ns, restN) {
+					seen[head] = true
+					v := it
+					v.Text = head
+					v.Score = it.Score * 0.55
+					v.Source = it.Source + "+unit"
+					extra = append(extra, v)
+				}
+			}
+		}
+		items = append(items, extra...)
+
 		// Post-pass per item: learned-line boost and fill-in-the-middle
 		// verification.
 		for i := range items {
 			it := &items[i]
+			// In-scope identifiers: candidates reusing names the
+			// document already declared are likelier to be right.
+			// Frequency-weighted (nested cache model): an ident seen
+			// ten times in the file is a stronger reuse signal than
+			// one seen once.
+			if len(scope) > 0 {
+				hits := 0
+				wsum := 0.0
+				for _, t := range tokenize.LexLine([]byte(it.Text)) {
+					if scope[t] {
+						hits++
+						if hits > 3 {
+							break
+						}
+						w := 0.6 + 0.4*math.Log2(1+float64(freq[t]))
+						if dirScope[t] {
+							// Directory prior: real but weaker than a
+							// name the file itself declares.
+							w *= 0.3
+						}
+						wsum += w
+					}
+				}
+				if hits > 0 {
+					// Multiplicative: a scoped name reorders within a
+					// source class but must not vault a weak retrieval
+					// hit over a stronger candidate outright.
+					it.Score *= 1 + 0.12*math.Min(wsum, 3)
+					it.Source = it.Source + "+scope"
+				}
+			}
+			// Per-source acceptance learning: sources that the caller
+			// historically accepts earn a multiplier, sources mostly
+			// rejected lose one. Computed from the live counters.
+			if dis&fSrc == 0 {
+				it.Score *= e.srcMult(baseSource(it.Source))
+			}
 			// Learned completions get stickier the more often the same
 			// completed line was accepted.
 			first := it.Text
@@ -1296,6 +1630,9 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+	if dis&fMMR == 0 {
+		items = dedupeShapes(items, scope)
+	}
 	if len(items) > e.cfg.MaxItems {
 		items = items[:e.cfg.MaxItems]
 	}
@@ -1303,6 +1640,162 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 	// write lock here would convoy every concurrent reader.
 	e.recordShown(uri, curLineIdx, linePrefix, items)
 	return items
+}
+
+// dedupeShapes drops items whose identifier-masked shape repeats an
+// already-kept higher-ranked item: four variants of the same line
+// under different names are one idea, and the slots are better spent
+// on distinct completions. The first item per shape survives.
+func dedupeShapes(items []Item, scope map[string]bool) []Item {
+	var out []Item
+	seenSh := map[string]map[string]bool{}
+	for _, it := range items {
+		// LexLine stops at the first newline, so key on the first two
+		// lines: a multi-line variant differs from its single-line
+		// sibling and deserves its own slot.
+		rest := ""
+		if i := strings.IndexByte(it.Text, '\n'); i >= 0 {
+			rest = firstLineOf(it.Text[i+1:])
+		}
+		sh := lines.MaskedLine(lines.Normalize(firstLineOf(it.Text))) + "\x00" +
+			lines.MaskedLine(lines.Normalize(rest))
+		// Identifiers in the suggestion that are already in scope are
+		// real diversity: call(x) and call(y) are different offers when
+		// both names exist in the file. Only a variant that introduces
+		// no new scoped name is redundant.
+		var ids map[string]bool
+		for _, tk := range tokenize.LexLine([]byte(it.Text)) {
+			if scope[tk] {
+				if ids == nil {
+					ids = map[string]bool{}
+				}
+				ids[tk] = true
+			}
+		}
+		if sh != "\x00" {
+			if covered, ok := seenSh[sh]; ok && subsetIds(ids, covered) {
+				continue
+			}
+		}
+		if seenSh[sh] == nil {
+			seenSh[sh] = map[string]bool{}
+		}
+		for id := range ids {
+			seenSh[sh][id] = true
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+func subsetIds(a, b map[string]bool) bool {
+	for id := range a {
+		if !b[id] {
+			return false
+		}
+	}
+	return true
+}
+
+// adaptMinProb is the mean per-token model probability a rebound
+// continuation must reach to be emitted. Below it the n-gram itself
+// finds the renamed line implausible, so the retrieval hit is noise.
+const adaptMinProb = 0.004
+
+// lookupCtx returns the vocab ids of the trailing context tokens for
+// probability verification. Lookup only: verification must not grow
+// the vocab, and unknown context tokens simply shorten the window.
+func lookupCtx(m *model.Model, prefix string) []uint32 {
+	toks := tokenize.Lex([]byte(prefix))
+	var ids []uint32
+	for _, t := range toks {
+		if t == tokenize.EOF {
+			break
+		}
+		if id, ok := m.Vocab.Lookup(t); ok {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > m.N-1 {
+		ids = ids[len(ids)-(m.N-1):]
+	}
+	return ids
+}
+
+// restProb is the mean per-token probability of a suggested rest under
+// the model, rolling the context forward as tokens are scored. Only
+// vocab-known tokens count; a suggestion that is entirely novel names
+// returns 1 so novel-identifier lines are not penalized for being new.
+func restProb(m *model.Model, text string, ctx []uint32, q *model.Query) float64 {
+	cur := append([]uint32(nil), ctx...)
+	sum := 0.0
+	n := 0
+	for _, t := range tokenize.LexLine([]byte(text)) {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		id, ok := m.Vocab.Lookup(t)
+		if !ok {
+			// Unknown token: contributes nothing either way.
+			if len(cur) > m.N-1 {
+				cur = cur[len(cur)-(m.N-1):]
+			}
+			continue
+		}
+		p := m.Prob(id, cur, q)
+		if p < 1e-9 {
+			p = 1e-9
+		}
+		sum += math.Log(p)
+		n++
+		cur = append(cur, id)
+		if len(cur) > m.N-1 {
+			cur = cur[len(cur)-(m.N-1):]
+		}
+		if n >= 16 {
+			break
+		}
+	}
+	if n == 0 {
+		return 1
+	}
+	return math.Exp(sum / float64(n))
+}
+
+// srcMult returns the learned per-source score multiplier: the
+// source's share of accepted decisions relative to the global accept
+// rate, clamped so a cold-start or unlucky source is never silenced.
+func (e *Engine) srcMult(src string) float64 {
+	e.shmu.Lock()
+	defer e.shmu.Unlock()
+	var acc, rej int
+	var gAcc, gRej int
+	for s, n := range e.accN {
+		gAcc += n
+		if s == src {
+			acc = n
+		}
+	}
+	for s, n := range e.rejN {
+		gRej += n
+		if s == src {
+			rej = n
+		}
+	}
+	const alpha = 4.0 // Laplace smoothing: a few events move little
+	rate := (float64(acc) + alpha) / (float64(acc+rej) + 2*alpha)
+	grate := (float64(gAcc) + alpha) / (float64(gAcc+gRej) + 2*alpha)
+	if grate <= 0 {
+		return 1
+	}
+	m := rate / grate
+	if m > 1.6 {
+		m = 1.6
+	}
+	if m < 0.6 {
+		m = 0.6
+	}
+	return m
 }
 
 // accept filters out suggestions that duplicate text already after the
@@ -1386,6 +1879,322 @@ func fileLines(text, prefix, exclude string, curLine, limit int) []string {
 	return order
 }
 
+// fileAdaptLines is fileLines with identifier masking: lines whose
+// shape matches the prefix get their identifiers rebound to the ones
+// typed. Closest occurrence wins per distinct continuation.
+func fileAdaptLines(text, prefix, exclude string, curLine, limit int) []string {
+	norm := lines.Normalize(prefix)
+	if len(norm) < 3 {
+		return nil
+	}
+	best := map[string]int{}
+	var order []string
+	lineNo := 0
+	start := 0
+	for i := 0; i <= len(text); i++ {
+		if i == len(text) || text[i] == '\n' {
+			l := lines.Normalize(text[start:i])
+			d := lineNo - curLine
+			if d < 0 {
+				d = -d
+			}
+			lineNo++
+			start = i + 1
+			if l != exclude && !strings.HasPrefix(l, norm) &&
+				lines.MatchesMasked(l, norm) {
+				if rest := lines.Rebind(l, norm); len(rest) >= 2 {
+					if bd, ok := best[rest]; !ok {
+						best[rest] = d
+						order = append(order, rest)
+					} else if d < bd {
+						best[rest] = d
+					}
+				}
+			}
+		}
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		return best[order[i]] < best[order[j]]
+	})
+	if len(order) > limit {
+		order = order[:limit]
+	}
+	return order
+}
+
+// scopeInfo lexes the document prefix once and returns the set of
+// non-keyword identifiers in scope, their occurrence counts, and
+// whether the context is thin: too few real tokens for the n-gram
+// model to anchor on. The counts feed the nested-cache boost.
+func scopeInfo(prefix string) (map[string]bool, map[string]int, bool) {
+	toks := tokenize.Lex([]byte(prefix))
+	if n := len(toks); n > 0 && toks[n-1] == tokenize.EOF {
+		toks = toks[:n-1]
+	}
+	scope := map[string]bool{}
+	freq := map[string]int{}
+	ntok := 0
+	for _, t := range toks {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		ntok++
+		if tokenize.IsIdentTok(t) && !tokenize.IsKeywordish(t) && len(scope) < 512 {
+			scope[t] = true
+			freq[t]++
+		}
+	}
+	return scope, freq, ntok <= 4
+}
+
+// docLang returns the effective language at the cursor: usually the
+// file's language, but fenced code blocks in markdown and script
+// bodies in html/svelte/vue host embedded code whose language the
+// priors and lang tables should follow instead.
+func docLang(base, prefix string) string {
+	switch base {
+	case "markdown", "md", "html", "svelte", "vue", "php":
+	default:
+		return base
+	}
+	if base == "markdown" || base == "md" {
+		// Inside a fence when the count of fence lines is odd.
+		n := 0
+		last := ""
+		for i := 0; i+2 < len(prefix); i++ {
+			if prefix[i] == '`' && prefix[i+1] == '`' && prefix[i+2] == '`' &&
+				(i == 0 || prefix[i-1] == '\n') {
+				n++
+				end := i + 3
+				for end < len(prefix) && prefix[end] != '\n' {
+					end++
+				}
+				last = strings.TrimSpace(prefix[i+3 : end])
+			}
+		}
+		if n%2 == 1 {
+			if l, ok := fenceLang[last]; ok {
+				return l
+			}
+		}
+		return base
+	}
+	// Markup hosts: the innermost unclosed block wins.
+	if i := strings.LastIndex(prefix, "<?php"); i >= 0 &&
+		!strings.Contains(prefix[i:], "?>") {
+		return "php"
+	}
+	if i := strings.LastIndex(prefix, "<script"); i >= 0 &&
+		!strings.Contains(prefix[i:], "</script") {
+		if strings.Contains(prefix[i:i+min(200, len(prefix)-i)], "ts") {
+			return "typescript"
+		}
+		return "javascript"
+	}
+	return base
+}
+
+// fenceLang maps fence tags to LangOf buckets.
+var fenceLang = map[string]string{
+	"go": "go", "golang": "go",
+	"py": "python", "python": "python",
+	"js": "javascript", "javascript": "javascript",
+	"ts": "typescript", "typescript": "typescript",
+	"rs": "rust", "rust": "rust",
+	"sh": "shell", "bash": "shell", "shell": "shell",
+	"c": "c", "cpp": "cpp", "c++": "cpp",
+	"java": "java", "lua": "lua", "sql": "sql",
+	"yaml": "yaml", "yml": "yaml", "json": "json",
+	"html": "html", "css": "css", "nix": "nix",
+}
+
+// importCands returns directory candidates for the dir-level scope
+// union: the file's own directory plus the paths named by its import
+// statements. Resolution against the corpus table happens under the
+// engine lock in resolveDirs.
+func importCands(prefix, ownDir string) []string {
+	var out []string
+	if ownDir != "" {
+		out = append(out, ownDir)
+	}
+	// Scan a bounded window: imports live at the top of a file.
+	head := prefix
+	if len(head) > 8192 {
+		head = head[:8192]
+	}
+	for _, m := range importPaths(head) {
+		if len(out) >= 12 {
+			break
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// resolveDirs maps import candidate paths to corpus directories: the
+// file's own dir by exact key, imports by longest path-suffix match
+// against the dir-ident table's suffix index. Call under e.mu.
+func (e *Engine) resolveDirs(cands []string) []string {
+	var out []string
+	for i, c := range cands {
+		if i == 0 {
+			// Own directory: exact match only.
+			if _, ok := e.dirIds[c]; ok {
+				out = append(out, c)
+			}
+			continue
+		}
+		if strings.HasPrefix(c, ".") {
+			// Relative module specifier: resolve against the file's
+			// own directory (cands[0]).
+			c = strings.Trim(pathpkg.Join(cands[0], c), "/")
+		}
+		segs := strings.Split(strings.Trim(c, "/"), "/")
+		for n := min(len(segs), 3); n > 0; n-- {
+			tail := strings.Join(segs[len(segs)-n:], "/")
+			if ds := e.dirSuf[tail]; len(ds) > 0 {
+				out = append(out, ds...)
+				break
+			}
+		}
+		if len(out) > 12 {
+			break
+		}
+	}
+	return out
+}
+
+// importPaths extracts import path strings from a file head. Cheap
+// string scan over quoted paths and dotted module names; deliberately
+// generous, misses only affect the adjacency boost.
+func importPaths(head string) []string {
+	var out []string
+	for _, ln := range strings.Split(head, "\n") {
+		ln = strings.TrimSpace(ln)
+		// Quoted path: "a/b/c" or 'a/b/c' — Go imports, JS module
+		// specifiers, side-effect imports.
+		for _, q := range []byte{'"', '\''} {
+			if i := strings.IndexByte(ln, q); i >= 0 {
+				if j := strings.IndexByte(ln[i+1:], q); j > 0 {
+					s := ln[i+1 : i+1+j]
+					if strings.Contains(s, "/") && len(s) < 200 {
+						out = append(out, s)
+					}
+				}
+				break
+			}
+		}
+		// Python: "import a.b.c" / "from a.b import x".
+		if strings.HasPrefix(ln, "import ") || strings.HasPrefix(ln, "from ") {
+			f := strings.Fields(ln)
+			for _, w := range f[1:] {
+				if strings.Contains(w, ".") && len(w) < 120 {
+					out = append(out, strings.ReplaceAll(strings.Trim(w, ","), ".", "/"))
+					break
+				}
+			}
+		}
+		if len(out) > 24 {
+			break
+		}
+	}
+	return out
+}
+
+// fileDir returns the directory part of a URI or path, "" when there
+// is none or it is the filesystem root.
+func fileDir(uri string) string {
+	p := uri
+	if i := strings.Index(p, "://"); i >= 0 {
+		p = p[i+3:]
+	}
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	d := pathpkg.Dir(p)
+	if d == "." || d == "/" {
+		return ""
+	}
+	return d
+}
+
+// goPkgName derives a plausible package name from a directory: the
+// base name lowercased, invalid identifier bytes folded to nothing.
+func goPkgName(dir string) string {
+	base := pathpkg.Base(dir)
+	var b strings.Builder
+	for i := 0; i < len(base); i++ {
+		c := base[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9' && b.Len() > 0) {
+			b.WriteByte(c)
+		}
+	}
+	s := b.String()
+	if s == "" || s == "internal" || s == "cmd" || s == "vendor" {
+		// Conventional dirs carry no package signal; the file-start
+		// priors cover these.
+		return ""
+	}
+	return s
+}
+
+// firstUnit finds a shorter self-contained prefix of a continuation:
+// the point where the completed syntactic unit ends and trailing
+// material begins. Retrieval hits sometimes carry extra tokens that
+// are attested but unwanted (a field name plus its struct tag, a call
+// plus the statement after it). Offering the unit alone as a cheaper
+// variant lets the caller accept just the head.
+func firstUnit(rest string) (string, bool) {
+	toks := tokenize.LexLine([]byte(rest))
+	if len(toks) < 3 {
+		return "", false
+	}
+	depth := 0
+	lastNW := -1 // index of last non-whitespace token
+	cut := -1
+	for i, t := range toks {
+		switch t {
+		case "(", "[", "{":
+			depth++
+		case ")", "]", "}":
+			depth--
+		}
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		if i == 0 {
+			lastNW = i
+			continue
+		}
+		if depth <= 0 {
+			// A struct tag or raw string right after an identifier is
+			// trailing material on a complete head. Single-character
+			// names count: "k `json:...`" is still field + tag.
+			if t[0] == '`' && lastNW >= 0 && isIdentByte(toks[lastNW][0]) {
+				cut = i
+				break
+			}
+			// A statement boundary: everything after is a new unit.
+			if t == ";" {
+				cut = i + 1
+				break
+			}
+		}
+		lastNW = i
+	}
+	if cut < 0 {
+		return "", false
+	}
+	head := strings.TrimRight(strings.Join(toks[:cut], ""), " \t")
+	if head == "" || len(head) >= len(rest) {
+		return "", false
+	}
+	return head, true
+}
+
 // generate produces model-driven continuations.
 func (e *Engine) generate(user, uri, text string, offset int, linePrefix string) []Item {
 	prefix := text[:offset]
@@ -1447,7 +2256,7 @@ func (e *Engine) generate(user, uri, text string, offset int, linePrefix string)
 		nextLines:  nextLinesNorm(text, offset, e.cfg.MaxLines),
 		curLineRaw: curLine,
 		openExpr:   endsInOperator(linePrefix),
-		lang:       LangOf(uri),
+		lang:       docLang(LangOf(uri), prefix),
 	}
 	if e.struc != nil {
 		var st tokenize.StructState
@@ -1467,6 +2276,23 @@ func (e *Engine) generate(user, uri, text string, offset int, linePrefix string)
 	var out []Item
 	extra, synth := e.subCands(ctx, partial)
 	gen := e.chain(ctx, caches, partial, o, q, extra)
+
+	// Operator token healing: when the prefix ends in a bare ":" in
+	// Go, the dominant continuation is almost always the fused ":="
+	// token, which the tokenizer never sees split. Emit a healed
+	// variant chain where the ":" is retracted and the first token
+	// is constrained to extend it. Extra candidates only: the
+	// unhealed items stay, ranking decides.
+	if disabledFeatures()&fHeal == 0 && o.lang == "go" && len(toks) > 0 && partial == "" &&
+		toks[len(toks)-1] == ":" && len(ids) > 0 {
+		if _, ok := e.m.Vocab.Lookup(":="); ok {
+			for _, cand := range e.chain(ctx[:len(ctx)-1], caches, ":", o, q, nil) {
+				if cand != "" {
+					gen = append(gen, cand)
+				}
+			}
+		}
+	}
 	n := len(gen)
 	for i, cand := range gen {
 		if cand == "" {
@@ -1720,6 +2546,7 @@ func (e *Engine) generateBlock(ctx []uint32, caches []*model.Cache, firstTok uin
 	freshLine := false       // generating a line after a newline token
 	linesDone := 0           // new lines committed (current line excluded)
 	depth := 0               // bracket depth relative to the cursor
+	lastEm := ""             // last non-space token on the current line
 	curIndent := leadingWS(o.curLineRaw)
 
 	emit := func(s string) {
@@ -1727,6 +2554,9 @@ func (e *Engine) generateBlock(ctx []uint32, caches []*model.Cache, firstTok uin
 			line.WriteString(s)
 		} else {
 			b.WriteString(s)
+			if strings.TrimSpace(s) != "" {
+				lastEm = s
+			}
 		}
 	}
 	flushLine := func() (dup bool) {
@@ -1795,6 +2625,21 @@ func (e *Engine) generateBlock(ctx []uint32, caches []*model.Cache, firstTok uin
 			break
 		}
 
+		// Confidence cliff on the current line: once a plausible head
+		// is emitted (an identifier, literal, or closer), a structural
+		// token far below the running mean starts an unrelated
+		// construct rather than continuing the answer. Identifiers are
+		// exempt: a rare-but-valid name is normal mid-expression.
+		// logSum already folded in this token's p, so the mean is
+		// computed over the earlier tokens only.
+		if step >= 2 && linesDone == 0 && depth <= 0 && logN >= 4 &&
+			unitHead(lastEm) && cliffTok(s) && disabledFeatures()&fCliff == 0 {
+			meanP := math.Exp((logSum - math.Log(max(p, 1e-9))) / float64(logN-1))
+			if meanP > 0.5 && p < meanP*0.35 && p < 0.45 {
+				break
+			}
+		}
+
 		if t == e.nlID {
 			if step == 0 && o.openExpr {
 				goto done // leading newline would strand an open expression
@@ -1861,6 +2706,31 @@ done:
 
 func isIndentToken(s string) bool {
 	return len(s) > 1 && (s[0] == ' ' || s[0] == '\t')
+}
+
+// unitHead reports whether s can end a syntactic unit: a closer, a
+// statement terminator, a literal, or a non-keyword identifier. Used
+// by the confidence cliff to tell a complete head from a token that
+// still expects a continuation (operators, commas, keywords).
+func unitHead(s string) bool {
+	if s == ")" || s == "]" || s == ";" {
+		return true
+	}
+	if n := len(s); n > 0 && (s[n-1] == '"' || s[n-1] == '\'' || s[n-1] == '`') {
+		return true
+	}
+	return tokenize.IsIdentTok(s) && !tokenize.IsKeywordish(s)
+}
+
+// cliffTok reports whether s is a structural token that starts a new
+// construct: a statement boundary, a raw string or tag, or a keyword.
+// The confidence cliff only fires on these, so a low-probability but
+// legitimate identifier mid-expression never truncates a chain.
+func cliffTok(s string) bool {
+	if s == "" {
+		return false
+	}
+	return s == ";" || s[0] == '`' || tokenize.IsKeywordish(s)
 }
 
 // hash4 hashes the last 3 context ids plus a candidate into a loop

@@ -15,7 +15,11 @@ func buildEngineFrom(t *testing.T, cfg Config, files map[string]string) *Engine 
 	t.Helper()
 	dir := t.TempDir()
 	for name, src := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
