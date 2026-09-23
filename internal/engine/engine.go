@@ -1560,7 +1560,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			corpOnly := false
 			if isDot {
 				if call != "" {
-					mems = callMembers(call, pf, e.sessFacts, e.callMem)
+					mems = callMembers(call, pf, e.sessFacts, e.tyMem, e.callMem)
 				} else {
 					mems, corpOnly = membersFor(chain, pf, e.sessFacts, e.tyMem, e.callMem)
 				}

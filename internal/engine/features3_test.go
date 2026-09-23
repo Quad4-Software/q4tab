@@ -171,6 +171,10 @@ func TestPlausibleFilters(t *testing.T) {
 		{"conversion ok", "int(v)", "f(", true},
 		{"composite lit ok", "map[string]any{", "x := f(", true},
 		{"plain arg", ` "x")`, "f(", true},
+		{"decl after send", " i := 0; i < n", "ch <-", false},
+		{"decl in call arg", " i := 0", "f(", false},
+		{"decl at stmt start ok", " i := 0", "x = f()\n\t", true},
+		{"dot junk in operand", ".N; i := 0", "ch <-", false},
 	}
 	for _, c := range cases {
 		if got := plausible(c.cand, c.line); got != c.want {
@@ -192,5 +196,111 @@ func TestExtractFactsBasics(t *testing.T) {
 	}
 	if !f.decls["ErrNotFound"] || !f.decls["Store"] {
 		t.Fatalf("decls missing: %v", f.decls)
+	}
+}
+
+func TestMemberIndexChain(t *testing.T) {
+	// "w.q.jobs[0]." collapses the index to its container link:
+	// Worker -> Queue -> []Job -> Job fields.
+	chain, call, ok := dotChain("\tw.q.jobs[0].")
+	if !ok || call != "" {
+		t.Fatalf("dotChain: %v %q %v", chain, call, ok)
+	}
+	if len(chain) != 3 || chain[0] != "w" || chain[2] != "jobs" {
+		t.Fatalf("chain wrong: %v", chain)
+	}
+
+	f := extractFactsToks(tokenize.Lex([]byte(`package q
+
+type Job struct {
+	ID string
+}
+
+type Queue struct {
+	jobs []Job
+}
+
+type Worker struct {
+	q *Queue
+}
+
+func (w *Worker) tick() {
+}
+`)))
+	mems, _ := membersFor(chain, f, nil, nil, nil)
+	var got []string
+	for _, m := range mems {
+		got = append(got, m)
+	}
+	if len(mems) == 0 || mems[0] != "ID" {
+		t.Fatalf("index chain members wrong: %v", got)
+	}
+}
+
+func TestReturnTypeCompletion(t *testing.T) {
+	// "NewQueue()." has no observed chained-member usage; the
+	// declared result type carries it.
+	f := extractFactsToks(tokenize.Lex([]byte(`package q
+
+type Queue struct {
+	jobs []int
+}
+
+func NewQueue() *Queue { return &Queue{} }
+
+func (q *Queue) Push(j int) {}
+func (q *Queue) Len() int { return 0 }
+
+func bad() (int, error) { return 0, nil }
+`)))
+	if f.retT["NewQueue"] != "Queue" {
+		t.Fatalf("retT wrong: %v", f.retT)
+	}
+	if f.retT["bad"] != "" {
+		t.Fatalf("builtin results should not record: %v", f.retT)
+	}
+	mems := callMembers("NewQueue", f, nil, nil, nil)
+	var flat []string
+	for _, m := range mems {
+		flat = append(flat, m)
+	}
+	want := map[string]bool{"Push(": true, "Len(": true, "jobs": true}
+	for _, w := range []string{"Push(", "Len(", "jobs"} {
+		found := false
+		for _, m := range flat {
+			if m == w {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("want %q in %v", w, flat)
+		}
+	}
+	_ = want
+}
+
+func TestCallMemCorpusInjection(t *testing.T) {
+	// A function whose result type has corpus members gets them in
+	// CallMem even with zero observed chained uses.
+	fb := newFactBuilder()
+	fb.Add(tokenize.Lex([]byte(`package q
+
+type Sess struct{}
+
+func (s *Sess) Close() {}
+func (s *Sess) Flush() {}
+
+func Dial() (*Sess, error) { return nil, nil }
+`)))
+	tyMem, callM := fb.Compact()
+	if len(tyMem["Sess"]) == 0 {
+		t.Fatal("no Sess members")
+	}
+	var flat string
+	for _, m := range callM["Dial"] {
+		flat += m + " "
+	}
+	if !strings.Contains(flat, "Close(") {
+		t.Fatalf("Dial should offer Sess members via retT: %v", flat)
 	}
 }

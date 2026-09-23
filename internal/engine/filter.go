@@ -113,10 +113,19 @@ func plausible(cand, linePrefix string) bool {
 		if strings.IndexByte(cand, '`') >= 0 {
 			return false
 		}
+		// A leading dot is member-access residue, never an operand.
+		if c == '.' {
+			return false
+		}
 		if isIdentStart(c) {
 			j := ci
 			for j < len(cand) && isIdentByte(cand[j]) {
 				j++
+			}
+			// "x :=" is a declaration, never an operand: kills
+			// loop-header junk landing after <- or inside calls.
+			if strings.HasPrefix(strings.TrimLeft(cand[j:], " \t"), ":=") {
+				return false
 			}
 			if scalarTypes[cand[ci:j]] {
 				// Allowed only as a conversion: int(x) not int `tag`.

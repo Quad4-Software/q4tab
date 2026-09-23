@@ -22,6 +22,7 @@ type facts struct {
 	tyMem map[string]map[string]bool   // type -> member ("Name(" = method, "Name" = field)
 	tyFld map[string]map[string]string // type -> field name -> field type
 	callM map[string]map[string]int    // func name -> member invoked on its result
+	retT  map[string]string            // func or method name -> first non-builtin result type
 	decls map[string]bool              // top-level declared names (var/const/type/func)
 }
 
@@ -31,6 +32,7 @@ func newFacts() *facts {
 		tyMem: map[string]map[string]bool{},
 		tyFld: map[string]map[string]string{},
 		callM: map[string]map[string]int{},
+		retT:  map[string]string{},
 		decls: map[string]bool{},
 	}
 }
@@ -73,6 +75,9 @@ func (f *facts) merge(o *facts) {
 		for mem, n := range ms {
 			m[mem] += n
 		}
+	}
+	for fn, t := range o.retT {
+		f.retT[fn] = t
 	}
 	for d := range o.decls {
 		f.decls[d] = true
@@ -187,6 +192,11 @@ func extractFactsToks(toks []string) *facts {
 					if m := atTok(toks, j); identTok(m) &&
 						atTok(toks, nonWS(toks, j+1)) == "(" {
 						f.addMem(rtype, m, true)
+						if pe := matchParen(toks, nonWS(toks, j+1)); pe > 0 {
+							if rt := resultType(toks, pe); rt != "" {
+								f.retT[m] = rt
+							}
+						}
 						i = j // let the "(" case record the call frame
 						continue
 					}
@@ -197,7 +207,7 @@ func extractFactsToks(toks []string) *facts {
 				}
 				// Plain func: scan its parameter list for typed
 				// names so "w http.ResponseWriter" teaches w.
-				scanParams(toks, i, f.recv)
+				scanParams(toks, i, f)
 			}
 		case "type":
 			j := nonWS(toks, i+1)
@@ -296,15 +306,67 @@ func recvDecl(toks []string, open int) (name, typ string, end int) {
 	return "", "", 0
 }
 
+// matchParen returns the index of the ")" matching the "(" at open,
+// or -1 when the list does not close within a sane bound. Signatures
+// may span lines, so newlines do not terminate the search; the bound
+// keeps incomplete code from running to EOF per decl.
+func matchParen(toks []string, open int) int {
+	depth := 0
+	for i := open; i < len(toks) && i < open+512; i++ {
+		switch toks[i] {
+		case "(":
+			depth++
+		case ")":
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// builtinType reports whether s is a result ident carrying no member
+// information: scalars, error, and keywords.
+func builtinType(s string) bool {
+	switch s {
+	case "error", "string", "bool", "any", "comparable",
+		"int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+		"byte", "rune", "float32", "float64", "complex64", "complex128":
+		return true
+	}
+	return tokenize.IsKeywordish(s)
+}
+
+// resultType scans the tokens after a signature's closing ")" for
+// the result list and returns the last non-builtin type ident:
+// "(*Job, error)" -> Job, "*Queue" -> Queue, "error" -> "".
+func resultType(toks []string, close int) string {
+	last := ""
+	for i := close + 1; i < len(toks); i++ {
+		t := toks[i]
+		switch t {
+		case "{", tokenize.NL, ";":
+			return last
+		}
+		if identTok(t) && !builtinType(t) {
+			last = t
+		}
+	}
+	return last
+}
+
 // scanParams walks the parameter list of the func decl starting at
 // the "func" token and records ident -> type pairs like "a *T" and
-// "a, b *T". Best effort: stops at the first "{" or newline-ish
-// boundary after the closing paren.
-func scanParams(toks []string, fi int, recv map[string]string) {
+// "a, b *T", plus the function's result type into retT. Best effort:
+// stops at the signature's closing paren.
+func scanParams(toks []string, fi int, f *facts) {
 	i := nonWS(toks, fi+1)
 	if atTok(toks, i) == "(" {
 		return // method decl: recvDecl handles it
 	}
+	name := atTok(toks, i)
 	// Skip the name (and generics bracket) to the parameter opener.
 	for i < len(toks) && atTok(toks, i) != "(" && toks[i] != tokenize.NL {
 		i++
@@ -323,6 +385,9 @@ func scanParams(toks []string, fi int, recv map[string]string) {
 		case ")":
 			depth--
 			if depth <= 0 {
+				if rt := resultType(toks, i); rt != "" && identTok(name) {
+					f.retT[name] = rt
+				}
 				return
 			}
 			pending = pending[:0]
@@ -352,7 +417,7 @@ func scanParams(toks []string, fi int, recv map[string]string) {
 			if identTok(nt) && !tokenize.IsKeywordish(nt) {
 				pending = append(pending, t)
 				for _, p := range pending {
-					recv[p] = nt
+					f.recv[p] = nt
 				}
 				pending = pending[:0]
 			} else {
@@ -489,16 +554,19 @@ func sortMembers(mems []string) {
 
 // callMembers returns members observed on the result of function
 // name: "NewDecoder(...)." -> Decode(. Doc and session facts rank
-// ahead of corpus counts.
-func callMembers(name string, doc, sess *facts, callM map[string][]string) []string {
+// ahead of corpus counts. Declared result types fill the gap when
+// nothing in the corpus chains a member off the call: "NewQueue()."
+// resolves through "func NewQueue() *Queue" into Queue's members.
+func callMembers(name string, doc, sess *facts, tyMem, callM map[string][]string) []string {
 	seen := map[string]bool{}
 	var out []string
-	add := func(m string) {
+	addRaw := func(m string) {
 		if !seen[m] {
 			seen[m] = true
-			out = append(out, m+"(")
+			out = append(out, m)
 		}
 	}
+	add := func(m string) { addRaw(m + "(") }
 	if doc != nil {
 		for m := range doc.callM[name] {
 			add(m)
@@ -511,6 +579,21 @@ func callMembers(name string, doc, sess *facts, callM map[string][]string) []str
 	}
 	for _, m := range callM[name] {
 		add(strings.TrimSuffix(m, "("))
+	}
+	for _, f := range []*facts{doc, sess} {
+		if f == nil {
+			continue
+		}
+		rt := f.retT[name]
+		if rt == "" {
+			continue
+		}
+		for m := range f.tyMem[rt] {
+			addRaw(m)
+		}
+		for _, m := range tyMem[rt] {
+			addRaw(m)
+		}
 	}
 	return out
 }
@@ -596,11 +679,28 @@ func dotChain(linePrefix string) (chain []string, call string, ok bool) {
 		}
 		return nil, toks[j], true
 	}
-	// Ident chain: a.b.c.
+	// Ident chain: a.b.c. Index expressions ("jobs[0].") collapse to
+	// their container link: field types already store the element
+	// type, so "w.q.jobs[0]." resolves as w -> q -> jobs -> element.
 	var rev []string
 	for i >= 0 {
 		t := toks[i]
 		if strings.TrimSpace(t) == "" {
+			i--
+			continue
+		}
+		if t == "]" {
+			depth := 0
+			for ; i >= 0; i-- {
+				if toks[i] == "]" {
+					depth++
+				} else if toks[i] == "[" {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
 			i--
 			continue
 		}
@@ -631,12 +731,14 @@ func dotChain(linePrefix string) (chain []string, call string, ok bool) {
 type factBuilder struct {
 	tyMem map[string]map[string]int // type -> member -> count
 	callM map[string]map[string]int // func -> member -> count
+	retT  map[string]string         // func -> declared result type
 }
 
 func newFactBuilder() *factBuilder {
 	return &factBuilder{
 		tyMem: map[string]map[string]int{},
 		callM: map[string]map[string]int{},
+		retT:  map[string]string{},
 	}
 }
 
@@ -651,6 +753,9 @@ func (fb *factBuilder) Add(toks []string) {
 		for m := range ms {
 			row[m]++
 		}
+	}
+	for fn, t := range f.retT {
+		fb.retT[fn] = t
 	}
 	for fn, ms := range f.callM {
 		row := fb.callM[fn]
@@ -699,6 +804,22 @@ func (fb *factBuilder) Compact() (map[string][]string, map[string][]string) {
 			out[k] = ls
 		}
 		return out
+	}
+	// Constructors and accessors return a type: teach callM their
+	// members at the survival floor so "NewT()." works corpus-wide
+	// even where no call site chains a member directly. Observed
+	// usage keeps its higher count and ranks above.
+	for fn, t := range fb.retT {
+		row := fb.callM[fn]
+		if row == nil {
+			row = map[string]int{}
+			fb.callM[fn] = row
+		}
+		for m := range fb.tyMem[t] {
+			if row[m] == 0 {
+				row[m] = 2
+			}
+		}
 	}
 	// Members are declarations: each appears once per codebase, so the
 	// df floor is 1. Call-site members are usage counts: a single
