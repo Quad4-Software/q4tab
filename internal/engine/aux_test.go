@@ -91,7 +91,7 @@ func TestLineBiSurfaces(t *testing.T) {
 	items := e.Complete("file:///f.go", text, len(text))
 	found := false
 	for _, it := range items {
-		if it.Source == "linebi" && strings.Contains(it.Text, "if err != nil") {
+		if strings.HasPrefix(it.Source, "linebi") && strings.Contains(it.Text, "if err != nil") {
 			found = true
 		}
 	}

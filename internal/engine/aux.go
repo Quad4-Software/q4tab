@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -37,6 +38,15 @@ type Bundle struct {
 	Langs  map[string]*model.LangTable
 	Sub    *model.Model
 	Idents *model.IdentIndex
+	// FileStarts maps a language to its most common first non-blank
+	// lines: the prior for what a new file in that language opens
+	// with. Powers thin-context proposals.
+	FileStarts map[string][]string
+	// DirIdents maps a directory path to its most frequent
+	// non-keyword identifiers: the names a package or directory is
+	// built around. Powers the directory-level cache and the
+	// import-adjacency boost.
+	DirIdents map[string][]string
 }
 
 // LangOf classifies a path or URI into a language bucket. Extensions
@@ -201,6 +211,158 @@ func rowsToOrder(rows map[uint64]map[uint32]uint32, minCnt uint32, rowCap int) *
 type langRows struct {
 	uni map[uint32]uint32
 	bi  map[uint64]map[uint32]uint32 // prev token -> next -> count
+}
+
+// startBuilder counts the first non-blank line of each file under its
+// language bucket. In a thin context (a fresh or nearly-empty file)
+// these priors seed plausible openings: package decls, imports,
+// shebangs.
+type startBuilder struct {
+	m map[string]map[string]int // lang -> normalized line -> file count
+}
+
+func newStartBuilder() *startBuilder {
+	return &startBuilder{m: map[string]map[string]int{}}
+}
+
+// Add records the file's first non-blank normalized line.
+func (sb *startBuilder) Add(path string, data []byte) {
+	var l string
+	for len(data) > 0 {
+		line := data
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line, data = data[:i], data[i+1:]
+		} else {
+			data = nil
+		}
+		if l = lines.Normalize(string(line)); l != "" {
+			break
+		}
+	}
+	if l == "" || len(l) > 96 {
+		return // empty file, or a minified/generated blob
+	}
+	lang := LangOf(path)
+	t := sb.m[lang]
+	if t == nil {
+		t = map[string]int{}
+		sb.m[lang] = t
+	}
+	t[l]++
+}
+
+// Compact keeps each language's top lines seen in enough files to be
+// a convention rather than a one-off.
+func (sb *startBuilder) Compact(top, minFiles int) map[string][]string {
+	out := make(map[string][]string, len(sb.m))
+	for lang, t := range sb.m {
+		type ent struct {
+			l string
+			n int
+		}
+		var es []ent
+		for l, n := range t {
+			if n >= minFiles {
+				es = append(es, ent{l, n})
+			}
+		}
+		sort.Slice(es, func(i, j int) bool {
+			if es[i].n != es[j].n {
+				return es[i].n > es[j].n
+			}
+			return es[i].l < es[j].l
+		})
+		if len(es) > top {
+			es = es[:top]
+		}
+		if len(es) == 0 {
+			continue
+		}
+		ls := make([]string, len(es))
+		for i, e := range es {
+			ls[i] = e.l
+		}
+		out[lang] = ls
+	}
+	return out
+}
+
+// dirBuilder counts non-keyword identifier occurrences per directory.
+// The table answers "what names does this package center on", which
+// is both a directory-level cache signal (files under the same dir
+// share vocabulary) and an import-adjacency signal (a file importing
+// pkg/foo probably wants foo's names).
+type dirBuilder struct {
+	m map[string]map[string]int // dir -> ident -> count
+}
+
+func newDirBuilder() *dirBuilder {
+	return &dirBuilder{m: map[string]map[string]int{}}
+}
+
+// Add counts the file's identifiers under its directory. The byte
+// scan is cheaper than a full lex and good enough for a top-N table.
+func (db *dirBuilder) Add(path string, data []byte) {
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return
+	}
+	t := db.m[dir]
+	if t == nil {
+		t = map[string]int{}
+		db.m[dir] = t
+	}
+	start := -1
+	for i := 0; i <= len(data); i++ {
+		if i < len(data) && isIdentByte(data[i]) {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			if s := string(data[start:i]); len(s) >= 3 && isIdentStart(s[0]) &&
+				!tokenize.IsKeywordish(s) {
+				t[s]++
+			}
+			start = -1
+		}
+	}
+}
+
+// Compact keeps each directory's top idents by count.
+func (db *dirBuilder) Compact(top, minCnt int) map[string][]string {
+	out := make(map[string][]string, len(db.m))
+	for dir, t := range db.m {
+		type ent struct {
+			s string
+			n int
+		}
+		var es []ent
+		for s, n := range t {
+			if n >= minCnt {
+				es = append(es, ent{s, n})
+			}
+		}
+		sort.Slice(es, func(i, j int) bool {
+			if es[i].n != es[j].n {
+				return es[i].n > es[j].n
+			}
+			return es[i].s < es[j].s
+		})
+		if len(es) > top {
+			es = es[:top]
+		}
+		if len(es) == 0 {
+			continue
+		}
+		ls := make([]string, len(es))
+		for i, e := range es {
+			ls[i] = e.s
+		}
+		out[dir] = ls
+	}
+	return out
 }
 
 // langBuilder accumulates per-language token statistics.

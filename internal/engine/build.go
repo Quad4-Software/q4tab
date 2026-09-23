@@ -82,6 +82,8 @@ func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, m
 	gb := lines.NewGramBuilder()
 	sb := newStructBuilder()
 	langs := newLangBuilder()
+	starts := newStartBuilder()
+	dirs := newDirBuilder()
 	sv := model.NewVocab()
 	subB := model.NewBuilderPlain(sv, 3, subMinCnt)
 	syms := symbols.NewIndex()
@@ -101,6 +103,8 @@ func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, m
 		st.Bytes += len(f.Data)
 		lb.AddFile(f.Data)
 		gb.AddFile(f.Data)
+		starts.Add(f.Path, f.Data)
+		dirs.Add(f.Path, f.Data)
 		for _, s := range symbols.Extract(f.Path, f.Data) {
 			syms.Add(s)
 		}
@@ -149,12 +153,14 @@ func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, m
 	m := mb.Compact()
 	li := lb.Compact()
 	bun := &Bundle{
-		M:      m,
-		Lines:  li,
-		LineBi: gb.Compact(li),
-		Struct: sb.Compact(),
-		Langs:  langs.Compact(),
-		Sub:    subB.Compact(),
+		M:          m,
+		Lines:      li,
+		LineBi:     gb.Compact(li),
+		Struct:     sb.Compact(),
+		Langs:      langs.Compact(),
+		Sub:        subB.Compact(),
+		FileStarts: starts.Compact(8, 3),
+		DirIdents:  dirs.Compact(96, 3),
 	}
 	// Identifier index over the main vocab: subtoken path -> ident id,
 	// with the unigram continuation count as its frequency proxy.

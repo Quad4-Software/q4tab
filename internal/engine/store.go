@@ -190,6 +190,50 @@ func Save(path string, b *Bundle) error {
 	} else {
 		putU32(w, 0)
 	}
+
+	// File-start priors: lang -> common first lines. A trailing
+	// section: older readers stop at end of their known sections.
+	if len(b.FileStarts) > 0 {
+		langs := make([]string, 0, len(b.FileStarts))
+		for l := range b.FileStarts {
+			langs = append(langs, l)
+		}
+		sort.Strings(langs)
+		putU32(w, uint32(len(langs)))
+		for _, l := range langs {
+			putU16(w, uint16(len(l)))
+			w.Write([]byte(l))
+			putU32(w, uint32(len(b.FileStarts[l])))
+			for _, s := range b.FileStarts[l] {
+				putU16(w, uint16(len(s)))
+				w.Write([]byte(s))
+			}
+		}
+	} else {
+		putU32(w, 0)
+	}
+
+	// Directory identifier tables: dir -> top idents. Trailing
+	// section; older readers stop at their last known section.
+	if len(b.DirIdents) > 0 {
+		dirs := make([]string, 0, len(b.DirIdents))
+		for d := range b.DirIdents {
+			dirs = append(dirs, d)
+		}
+		sort.Strings(dirs)
+		putU32(w, uint32(len(dirs)))
+		for _, d := range dirs {
+			putU16(w, uint16(len(d)))
+			w.Write([]byte(d))
+			putU32(w, uint32(len(b.DirIdents[d])))
+			for _, s := range b.DirIdents[d] {
+				putU16(w, uint16(len(s)))
+				w.Write([]byte(s))
+			}
+		}
+	} else {
+		putU32(w, 0)
+	}
 	if w.err != nil {
 		return fail(w.err)
 	}
@@ -479,6 +523,54 @@ func Load(path string) (*Bundle, error) {
 				return nil, fmt.Errorf("model: corrupt ident index")
 			}
 			bun.Idents = &model.IdentIndex{Off: ioff, Blob: iblob, Ids: iids, Freq: ifreq}
+		}
+	}
+	if hasAux() {
+		nl := int(r.u32())
+		if nl < 0 || nl > 128 || r.err != nil {
+			return nil, fmt.Errorf("model: bad file-starts header")
+		}
+		if nl > 0 {
+			bun.FileStarts = map[string][]string{}
+			for i := 0; i < nl; i++ {
+				name := string(r.bytes(int(r.u16())))
+				ns := int(r.u32())
+				if ns < 0 || ns > 64 || r.err != nil {
+					return nil, fmt.Errorf("model: bad file-starts section")
+				}
+				ls := make([]string, ns)
+				for j := range ls {
+					ls[j] = string(r.bytes(int(r.u16())))
+				}
+				bun.FileStarts[name] = ls
+			}
+			if r.err != nil {
+				return nil, fmt.Errorf("model: truncated file-starts section")
+			}
+		}
+	}
+	if hasAux() {
+		nd := int(r.u32())
+		if nd < 0 || nd > 1<<20 || r.err != nil {
+			return nil, fmt.Errorf("model: bad dir-ident header")
+		}
+		if nd > 0 {
+			bun.DirIdents = map[string][]string{}
+			for i := 0; i < nd; i++ {
+				dir := string(r.bytes(int(r.u16())))
+				ns := int(r.u32())
+				if ns < 0 || ns > 1024 || r.err != nil {
+					return nil, fmt.Errorf("model: bad dir-ident section")
+				}
+				ls := make([]string, ns)
+				for j := range ls {
+					ls[j] = string(r.bytes(int(r.u16())))
+				}
+				bun.DirIdents[dir] = ls
+			}
+			if r.err != nil {
+				return nil, fmt.Errorf("model: truncated dir-ident section")
+			}
 		}
 	}
 	_ = mapped

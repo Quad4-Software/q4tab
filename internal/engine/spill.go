@@ -335,6 +335,8 @@ func buildIndexSpill(roots []string, order int, minCnt []uint32, tightenToks, me
 	gb := lines.NewGramBuilder()
 	sb := newStructBuilder()
 	langs := newLangBuilder()
+	starts := newStartBuilder()
+	dirs := newDirBuilder()
 	syms := symbols.NewIndex()
 	var st BuildStats
 	var tightened bool
@@ -351,6 +353,8 @@ func buildIndexSpill(roots []string, order int, minCnt []uint32, tightenToks, me
 		st.Bytes += len(f.Data)
 		lb.AddFile(f.Data)
 		gb.AddFile(f.Data)
+		starts.Add(f.Path, f.Data)
+		dirs.Add(f.Path, f.Data)
 		for _, s := range symbols.Extract(f.Path, f.Data) {
 			syms.Add(s)
 		}
@@ -494,12 +498,14 @@ func buildIndexSpill(roots []string, order int, minCnt []uint32, tightenToks, me
 
 	li := lb.Compact()
 	bun := &Bundle{
-		M:      m,
-		Lines:  li,
-		LineBi: gb.Compact(li),
-		Struct: sb.Compact(),
-		Langs:  langs.Compact(),
-		Sub:    sub,
+		M:          m,
+		Lines:      li,
+		LineBi:     gb.Compact(li),
+		Struct:     sb.Compact(),
+		Langs:      langs.Compact(),
+		Sub:        sub,
+		FileStarts: starts.Compact(8, 3),
+		DirIdents:  dirs.Compact(96, 3),
 	}
 	var uniFreq func(uint32) int32
 	if len(m.Uni) > 0 {
