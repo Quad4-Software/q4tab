@@ -48,7 +48,7 @@ func HandlePacket(data []byte) error {
 
 func buildTestEngine(t *testing.T) *engine.Engine {
 	dir := fixtureCorpus(t)
-	m, li, st, err := engine.BuildIndex([]string{dir}, 6, nil, nil)
+	bun, st, err := engine.BuildIndex([]string{dir}, 6, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func buildTestEngine(t *testing.T) *engine.Engine {
 		t.Fatalf("indexed %d files, want 2", st.Files)
 	}
 	e := engine.New(engine.DefaultConfig())
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	return e
 }
 
