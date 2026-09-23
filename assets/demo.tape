@@ -27,7 +27,7 @@ Sleep 400ms
 # beat 1: defer
 Type "i"
 Type "defer f."
-Sleep 2.5s
+Sleep 1.1s
 Tab
 Sleep 500ms
 
@@ -35,7 +35,7 @@ Sleep 500ms
 Escape
 Type "o"
 Type "fmt."
-Sleep 2.5s
+Sleep 1.1s
 Tab
 Sleep 500ms
 
@@ -43,9 +43,9 @@ Sleep 500ms
 Escape
 Type "o"
 Type "for i :="
-Sleep 2.5s
+Sleep 1.1s
 Tab
-Sleep 1.8s
+Sleep 1.5s
 
 Hide
 Escape
