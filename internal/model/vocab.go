@@ -104,18 +104,6 @@ func (v *Vocab) Len() int {
 	return len(v.offs) - 1
 }
 
-// Strings returns the id-ordered token table (copies. For save paths).
-func (v *Vocab) Strings() []string {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	out := make([]string, len(v.offs)-1)
-	for i := range out {
-		lo, hi := v.offs[i], v.offs[i+1]
-		out[i] = string(v.blob[lo:hi])
-	}
-	return out
-}
-
 // Blob returns the packed token blob and offsets (for persistence).
 func (v *Vocab) Blob() ([]byte, []uint32) {
 	v.mu.RLock()
@@ -129,18 +117,4 @@ func (v *Vocab) Intern(toks []string) []uint32 {
 		out[i] = v.ID(t)
 	}
 	return out
-}
-
-func (v *Vocab) InternLookup(toks []string) ([]uint32, bool) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	out := make([]uint32, len(toks))
-	for i, t := range toks {
-		id, ok := v.strToID[t]
-		if !ok {
-			return nil, false
-		}
-		out[i] = id
-	}
-	return out, true
 }

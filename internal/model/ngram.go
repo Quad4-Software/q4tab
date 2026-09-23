@@ -812,66 +812,17 @@ func (m *Model) probKN(tok uint32, ctx []uint32, k int, q *Query) float64 {
 	return (direct + m.lamK(k)*gamma*lower) / float64(tot)
 }
 
-// Top returns the highest-probability next tokens for ctx using
-// interpolation, limited to the row at the highest available order
-// (candidates not present in the row are not considered, matching how
-// count models rank).
-func (m *Model) Top(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
-	for k := m.N; k >= 1; k-- {
-		var useCtx []uint32
-		if k > 1 {
-			if len(ctx) >= k-1 {
-				useCtx = ctx[len(ctx)-(k-1):]
-			} else {
-				continue
-			}
-		}
-		var toks, cnts []int32
-		var tot int64
-		var ok bool
-		if m.KN && k == 1 {
-			// Unigram row is the flat array.
-			toks = make([]int32, len(m.UniTop))
-			for i, t := range m.UniTop {
-				toks[i] = int32(t)
-			}
-			ok = len(toks) > 0
-		} else {
-			toks, cnts, tot, _, ok = m.Orders[k].row(m.keyHash(useCtx), q)
-		}
-		if !ok || len(toks) == 0 {
-			continue
-		}
-		limit := len(toks)
-		if limit > 64 {
-			limit = 64
-		}
-		cands := make([]Cand, 0, limit)
-		for i := 0; i < limit; i++ {
-			t := uint32(toks[i])
-			var p float64
-			if m.KN {
-				p = m.probKN(t, ctx, k, q)
-			} else {
-				rowP := float64(cnts[i]) / float64(tot)
-				p = lam*rowP + (1-lam)*m.probAtOrder(t, ctx, k-1, lam, q)
-			}
-			cands = append(cands, Cand{Tok: t, P: p})
-		}
-		// toks are sorted by count desc. Interpolated score may reorder,
-		// so re-sort by p.
-		sort.Slice(cands, func(i, j int) bool { return cands[i].P > cands[j].P })
-		if len(cands) > maxK {
-			cands = cands[:maxK]
-		}
-		return cands
-	}
-	return nil
+// Prob returns the model's interpolated probability of tok following
+// ctx at the highest usable order. Used to verify candidates produced
+// by non-model sources (masked retrieval, priors) against what the
+// n-gram itself finds plausible.
+func (m *Model) Prob(tok uint32, ctx []uint32, q *Query) float64 {
+	return m.probKN(tok, ctx, m.N, q)
 }
 
 // TopUnion gathers candidate tokens from every order row that matches
 // ctx, scores each with the fully interpolated probability, and returns
-// the best maxK. Unlike Top, a sparse high-order row cannot hide strong
+// the best maxK. A sparse high-order row cannot hide strong
 // candidates that only exist in lower-order rows.
 func (m *Model) TopUnion(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
 	seen := make(map[uint32]bool)
