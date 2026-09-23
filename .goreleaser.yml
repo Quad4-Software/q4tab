@@ -1,0 +1,45 @@
+version: 2
+
+project_name: q4tab
+
+builds:
+  - id: q4tab
+    main: ./cmd/q4tab
+    binary: q4tab
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+
+archives:
+  - id: q4tab
+    name_template: "q4tab_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+sboms:
+  - id: archive
+    artifacts: archive
+
+signs:
+  - cmd: cosign
+    args:
+      - sign-blob
+      - "--yes"
+      - "--bundle=${artifact}.sigstore.json"
+      - "--output-signature=${artifact}.sig"
+      - "--output-certificate=${artifact}.pem"
+      - "${artifact}"
+    artifacts: all
+    output: true
+
+release:
+  extra_files:
+    - glob: ./vscode/q4tab-*.vsix
+    - glob: ./q4tab.nvim.tar.gz
