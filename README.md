@@ -1,15 +1,36 @@
 # q4tab
 
-Fully local code completion trained on your codebase. Statistical model,
-no cloud, no GPU, no network calls, no LLM. Single-digit-millisecond
-suggestions, single and multi-line.
+Fully local code completion trained on your codebase. Statistical
+n-gram model plus verbatim line retrieval: no cloud, no GPU, no
+network calls, no LLM. Single-digit-millisecond suggestions, single
+and multi-line.
 
-It works the way pre-2020 TabNine did: an n-gram model over your repos
-plus verbatim line retrieval, plus per-file and session caches so it
-learns as you type. Trained over the Quad4 corpus it suggests your real
-internal APIs, not generic ones.
+It learns as you type through per-file and session caches, and trained
+on your own repos it suggests your real internal APIs rather than
+generic ones.
 
 ## Install
+
+Tagged releases publish archives for linux, darwin, and windows on
+amd64 and arm64, plus the packaged VS Code extension and the Neovim
+plugin tarball. Tags `v*` are protected by a repository ruleset: once
+pushed they cannot be deleted, rewritten, or moved.
+
+```sh
+# verify a release asset
+curl -LO https://github.com/Quad4-Software/q4tab/releases/download/v0.1.0/q4tab_0.1.0_linux_amd64.tar.gz
+curl -LO https://github.com/Quad4-Software/q4tab/releases/download/v0.1.0/checksums.txt
+sha256sum -c checksums.txt --ignore-missing
+
+# keyless sigstore signature, tied to the release run
+curl -LO https://github.com/Quad4-Software/q4tab/releases/download/v0.1.0/q4tab_0.1.0_linux_amd64.tar.gz.sigstore.json
+cosign verify-blob --bundle q4tab_0.1.0_linux_amd64.tar.gz.sigstore.json q4tab_0.1.0_linux_amd64.tar.gz
+
+# SLSA build provenance lives in the repo attestations
+gh attestation verify q4tab_0.1.0_linux_amd64.tar.gz --repo Quad4-Software/q4tab
+```
+
+Build from source:
 
 ```sh
 go build -o bin/q4tab ./cmd/q4tab
@@ -18,36 +39,23 @@ cp bin/q4tab ~/.local/bin/
 
 ## Train
 
-Point it at directories, or mirror the whole org first:
-
 ```sh
-q4tab collect --org Quad4-Software --dest ~/corpus   # optional
+q4tab collect --org Quad4-Software --dest ~/corpus   # optional mirror
 q4tab index --root ~/projects --root ~/corpus
 ```
 
-The model lands in `~/.local/share/q4tab/model.bin` plus a
-`model.bin.manifest` used for incremental updates. Re-run `index`
-nightly or after big changes. For scale reference: 247k files / 272M
-tokens of mixed source (after content dedup) indexes in about 7 minutes
-on a desktop CPU and produces a ~2.8GB packed model (format v4, varint
-row streams, v2 and v3 files still load). The file
-is mmap'd read-only, so it loads in well under a second and only ~340MB
-stays resident. The rest faults in on demand and can be reclaimed by the
-OS under pressure.
+The model lands in `~/.local/share/q4tab/model.bin` plus a manifest for
+incremental updates. For scale reference: 272M tokens of mixed source
+indexes in about 7 minutes on a desktop CPU into a ~2.8GB packed model.
+The file is mmap'd read-only, loads in under a second, and only ~340MB
+stays resident.
 
-The default build is a disk-spill pipeline: workers lex and emit n-gram
-sightings into sorted run files (`-tmpdir`, default system temp, needs
-a few GB of scratch), then a k-way merge assembles the packed tables.
-Peak RSS stays around 6-7GB regardless of corpus size instead of
-scaling with token count. `-workers` sets the lexer/emitter pool
-(default cores - 1, capped at 8). `-spill=false` selects the older
-in-memory path. Duplicate file contents are indexed once; generated
-files, lockfiles, vendored and minified sources are skipped.
-
-For the in-memory path and the in-memory aux indexes under spill,
-`-budget` million tokens (default 48) tightens counting to repeat-only
-storage, and if RSS approaches `-mem` MB (default 70% of physical
-memory) the aux indexes freeze. `-budget 0 -mem -1` disables both.
+The default build is a disk-spill pipeline: workers emit sorted run
+files to `-tmpdir` (a few GB of scratch), then a k-way merge assembles
+the packed tables. Peak RSS stays around 6-7GB regardless of corpus
+size. `-workers` sets the pool size, `-spill=false` selects the
+in-memory path, `-budget`/`-mem` bound memory further. Duplicate,
+generated, vendored, and minified files are skipped.
 
 ### Incremental index
 
@@ -55,12 +63,9 @@ memory) the aux indexes freeze. `-budget 0 -mem -1` disables both.
 q4tab index -incr --root ~/projects --root ~/corpus
 ```
 
-Diffs the tree against the manifest: unchanged files are skipped,
-new/changed files are folded into `model.bin.delta` (a compact overlay
-the server merges at startup), deleted files drop out of the delta. Run
-it freely. When the delta grows large a full `index` rebuild folds
-everything back into the base. Lines from deleted files linger in the
-base model until that rebuild.
+Diffs the tree against the manifest and folds new or changed files into
+`model.bin.delta`, an overlay the server merges at startup. A full
+`index` rebuild folds everything back into the base.
 
 ## QA
 
@@ -68,19 +73,14 @@ base model until that rebuild.
 q4tab eval -root ~/projects/somerepo -files 50 -pos 10
 ```
 
-`eval` samples random mid-line cursor positions in real files, masks the
-tail as if you were typing, and reports hit@1 / hit@k and p50/p95
-latency per language. Add `-v` to print misses. On the org corpus it
-measures ~75% hit@1, ~90% hit@k, ~1ms p50.
-
-`go test -fuzz=FuzzLex ./internal/tokenize/` fuzzes the lexer.
+`eval` samples mid-line cursor positions in real files, masks the tail,
+and reports hit@1 / hit@k and p50/p95 latency per language. `-v` prints
+misses. `go test -fuzz=FuzzLex ./internal/tokenize/` fuzzes the lexer.
 
 ## Commit messages
 
-`commitmsg` drafts conventional-commit messages from your staged diff.
-It learns the repo's own conventions from git history rather than a
-general model, so `feat:` vs `add:` comes out however the project
-actually writes it:
+`commitmsg` drafts conventional-commit messages from the staged diff,
+trained on the repo's own git history:
 
 ```sh
 q4tab commitmsg -train -repo . -o ~/.local/share/q4tab/commits/myrepo
@@ -88,18 +88,11 @@ q4tab index -root ~/.local/share/q4tab/commits/myrepo -o /tmp/commit-model.q4m
 git add -p && q4tab commitmsg -model /tmp/commit-model.q4m
 ```
 
-`-train` rewrites `git log -p` into diff-to-message documents. Suggest
-mode reads `git diff --cached` (falling back to unstaged), infers the
-type and scope from the changed paths, and prints up to 5 candidates:
-model completions first, then a `type(scope): update <path>` fallback.
-It names the right identifiers and repo conventions, but it retrieves
-rather than summarizes. Treat the output as a starting point.
-
 Config is `~/.config/q4tab/config.json`:
 
 ```json
 {
-  "roots": ["/home/you/projects", "/home/you/corpus"],
+  "roots": ["~/projects", "~/corpus"],
   "order": 6,
   "maxLines": 4
 }
@@ -114,45 +107,35 @@ npm run package
 code --install-extension q4tab-0.1.0.vsix
 ```
 
-The extension spawns `q4tab serve` (resolved in order: the
-configured `q4tab.serverPath`, the binary bundled in the vsix,
-then PATH) and provides two completion surfaces: ghost-text inline
-suggestions that appear as you type, and the classic dropdown via
-Ctrl+Space. Tab accepts either one. Esc dismisses. Ctrl+Right accepts
-one word at a time.
+The extension spawns `q4tab serve` (resolved in order: the configured
+`q4tab.serverPath`, the binary bundled in the vsix, then PATH) and
+provides ghost-text inline suggestions and the classic dropdown. Tab
+accepts, Esc dismisses, Ctrl+Right accepts one word.
 
-Status bar shows model size when running, an error icon when the
-server fails (click for the log). Commands on the palette:
+Commands on the palette include `q4tab: Index Workspace` (folds open
+folders into the incremental delta and hot-reloads), `Restart Server`,
+`Toggle Completions`, `Show Status`, and `Show Log`.
 
-- `q4tab: Trigger Suggestion` (Alt+\\) - force a suggestion
-- `q4tab: Index Workspace` - folds open folders into the
-  incremental delta and hot-reloads it into the running server
-- `q4tab: Restart Server`, `q4tab: Toggle Completions`,
-  `q4tab: Show Status`, `q4tab: Show Log`
-
-Settings: `q4tab.serverPath`, `q4tab.modelPath`,
-`q4tab.enabled`, `q4tab.maxSuggestions`,
-`q4tab.requestTimeout`.
+Settings: `q4tab.serverPath`, `q4tab.modelPath`, `q4tab.enabled`,
+`q4tab.maxSuggestions`, `q4tab.requestTimeout`.
 
 ## Neovim
 
 Requires Neovim 0.12+, which has native `vim.lsp.inline_completion`.
 
-Put `nvim/` on your runtimepath (plugin manager of choice, or symlink
-`nvim/` into `~/.config/nvim/pack/*/start/`). Then:
+Put `nvim/` on your runtimepath (plugin manager, or symlink `nvim/`
+into `~/.config/nvim/pack/*/start/`). Then:
 
 ```lua
 require("q4tab").setup()
 ```
 
-Ghost text appears as you type. `Tab` accepts (falls through to a
-normal Tab when nothing is shown), `Alt-]` / `Alt-[` cycle candidates.
-Accepting a suggestion sends the attached learn command back to the
-server automatically. `:lua require("q4tab").toggle()` flips
-suggestions on and off. `setup({ completion = true })` additionally
-enables the builtin popup completion against the same server.
+`Tab` accepts, `Alt-]` / `Alt-[` cycle candidates, and accepts are
+reported back to the server automatically.
+`:lua require("q4tab").toggle()` flips suggestions on and off.
+`setup({ completion = true })` also enables builtin popup completion.
 
-No plugin? This minimal config still works on 0.12+:
+Minimal config without the plugin, 0.12+:
 
 ```lua
 vim.lsp.config('q4tab', { cmd = { 'q4tab', 'serve' } })
@@ -162,34 +145,30 @@ vim.lsp.inline_completion.enable()
 
 ## Server deployment
 
-Completions are one small request per keystroke, not a token stream,
-so the transport is plain request/response. No WebSockets, no SSE, no
-WebTransport: a persistent TCP socket with the normal LSP framing is
-the lowest-latency option, and HTTP covers everything else.
+Completions are one small request per keystroke, so the transport is
+plain request/response over a persistent TCP socket or HTTP.
 
 ```sh
-# editor-facing: LSP over TCP (same framing as stdio)
+# LSP over TCP (same framing as stdio)
 q4tab serve -listen 127.0.0.1:7917
 
-# operational/agent-facing: HTTP
+# HTTP
 q4tab serve -http 127.0.0.1:7918
 #   POST /rpc      JSON-RPC, same methods as the LSP transport
-#   POST /mcp      MCP endpoint (see below)
+#   POST /mcp      MCP endpoint
 #   GET  /status   engine stats as JSON
 #   GET  /healthz  liveness
 ```
 
-Both flags can be combined on one process. Each TCP connection gets an
-isolated document session. `/rpc` shares one session so didOpen and
-didChange state persists across requests.
+Both flags can be combined. Each TCP connection gets an isolated
+document session; `/rpc` shares one session so didOpen/didChange state
+persists.
 
-VS Code remote mode:
+Remote mode:
 
 ```json
 { "q4tab.serverAddr": "10.0.0.5:7917" }
 ```
-
-Neovim remote mode:
 
 ```lua
 require("q4tab").setup({ addr = "10.0.0.5:7917" })
@@ -198,21 +177,18 @@ require("q4tab").setup({ addr = "10.0.0.5:7917" })
 Warning: the model contains verbatim source lines. Bind to loopback or
 put the listener behind a VPN/TLS terminator before exposing it.
 
-## MCP (LLM / agent integration)
+## MCP
 
-q4tab doubles as an MCP server so coding agents can ground
-themselves in the corpus instead of guessing APIs.
+q4tab doubles as an MCP server so coding agents can ground themselves
+in the corpus instead of guessing APIs.
 
 ```sh
 q4tab mcp   # stdio transport, one JSON-RPC message per line
 ```
 
-Point any MCP client at that command (Claude Code: `claude mcp add
-q4tab -- q4tab mcp`), or POST to `/mcp` on the HTTP listener
-for remote agents. Speaks MCP `2025-06-18`, `2025-03-26`, and
-`2024-11-05`, plus `server/discover` for newer clients.
-
-Tools:
+Point any MCP client at that command or POST to `/mcp` on the HTTP
+listener. Speaks MCP `2025-06-18`, `2025-03-26`, `2024-11-05`, and
+`server/discover`.
 
 | tool | args | returns |
 |---|---|---|
@@ -221,21 +197,14 @@ Tools:
 | `learn` | `text`, `uri`, `line` | feeds the accept-learning loop |
 | `status` | none | corpus size, counters, memory |
 
-The division of labor: q4tab is the fast deterministic path in the
-editor, the LLM uses `lookup_lines`/`complete` to fetch real idioms for
-explanation, refactoring, and code review, and `learn` feeds accepted
-results back into the ranking.
-
 ## Other editors
 
-The server speaks LSP 3.18 including `textDocument/inlineCompletion`
-(UTF-16 positions, per spec). Any client that implements that method
-works with `q4tab serve` over stdio.
-
-## Try it without an editor
+The server speaks LSP 3.18 including `textDocument/inlineCompletion`.
+Any client implementing that method works with `q4tab serve` over
+stdio.
 
 ```sh
-q4tab complete -f somefile.go -line 12 -col 20
+q4tab complete -f somefile.go -line 12 -col 20   # CLI check
 q4tab stats
 ```
 
@@ -244,84 +213,63 @@ q4tab stats
 - `internal/tokenize` language-agnostic lexer with identifier subtoken
   splitting (camelCase, snake_case, digits)
 - `internal/model` order-6 n-gram with modified Kneser-Ney smoothing
-  (continuation counts, tiered discounts) plus two bloom-gated deep
-  orders that store only repeated verbatim contexts, and scoped caches
-  (Hellendoorn and Devanbu 2017 style locality)
+  plus bloom-gated deep orders storing only repeated contexts, and
+  scoped caches
 - `internal/lines` sorted unique-line index for verbatim continuations
-  plus a line n-gram table: previous line(s) -> likely next line
-- `internal/engine` merges the layers, tracks open docs, greedy
-  multi-line decode with bracket-depth and indentation awareness,
-  structural-context and per-language vote tables, and a journal-trained
-  rank calibrator
-- `internal/lsp` JSON-RPC stdio server
+  and a line n-gram table
+- `internal/engine` merges the layers, tracks open docs, decodes
+  multi-line blocks with bracket and indent awareness, and applies a
+  journal-trained rank calibrator
+- `internal/lsp` JSON-RPC server over stdio, TCP, and HTTP
 
-Ranking: same-file repetition first, then lines from other open files
-and accepted completions, then corpus verbatim matches, then n-gram
-generation conditioned on the lexical context.
+Ranking order: same-file repetition, then lines from open files and
+accepted completions, then corpus verbatim matches, then n-gram
+generation.
 
 ### Multi-line completion
 
-When the cursor is at end of line the engine may emit a whole block
-(e.g. `if err !=` -> the full `nil { return err }` body plus the
-closing brace). Generation stops at the configured line cap, at a
-closing dedent below the cursor's bracket depth, when it would
-reproduce code already after the cursor, or when confidence drops below
-the multi-line floor. Generated indentation is rewritten into the
-document's own indent unit (tabs vs spaces).
+At end of line the engine may emit a whole block. Generation stops at
+the line cap, at a dedent below the cursor's bracket depth, when it
+would reproduce text after the cursor, or when confidence drops.
+Indentation is rewritten into the document's own indent unit.
 
 ### Learning from accepts
 
-Accepted completions are sent back via `q4/learn` (the extension wires
-this to the accept event automatically. The server also accepts
-`workspace/executeCommand` with `q4tab.learn`). Accepted text is
-appended to `~/.local/share/q4tab/learned.jsonl`, replayed on
-startup, mixed into the learned n-gram cache, and indexed into the
-dynamic line index so the same context retrieves it next time. The
-journal self-compacts at 4MB. Set `Q4TAB_JOURNAL` to relocate it.
+Accepted completions are reported via `q4/learn` (the extension wires
+this automatically) and appended to `~/.local/share/q4tab/learned.jsonl`.
+The journal replays on startup, feeds the learned cache and dynamic
+line index, and self-compacts at 4MB. `Q4TAB_JOURNAL` relocates it.
 
-Shown-but-not-accepted suggestions are tracked too: every displayed item
-is recorded per (document, line), an accept marks its match and counts
-the rest as implicit rejects, and clients can send `q4/reject`
-explicitly. Per-source accept rates drive a bounded adaptive floor on
-the model's probability threshold, and repeat accepts boost the same
-completed line's rank next time. Counters are visible in `q4/status`.
+Shown-but-not-accepted items count as implicit rejects; per-source
+accept rates drive a bounded adaptive floor on the model threshold.
+Counters are visible in `q4/status`.
 
-### Fill-in-the-middle (light)
+### Fill-in-the-middle
 
-When the cursor sits mid-line, a suggestion that already ends with the
-existing tail becomes a zero-width insert of only the missing middle
-(`f(a, |b)` gets `x, ` before `b)`, not a clobbered line). Shorter
-suggestions are allowed to insert when the spliced line is attested in
-the static or dynamic index. Everything else keeps a replace-to-EOL
-range. No neural FIM model, only verification.
+When the cursor sits mid-line, a suggestion ending with the existing
+tail becomes a zero-width insert of only the missing middle. Everything
+else keeps a replace-to-EOL range.
 
 ### Directory scope
 
-Files in the same directory share a per-directory cache, so idioms from
-sibling files surface even before the session cache warms up. Capped at
-64 directories.
+Files in the same directory share a cache, so idioms from sibling files
+surface before the session cache warms up. Capped at 64 directories.
 
-### Edge cases handled
+### Edge cases
 
-- UTF-16 position mapping incl. astral characters and CRLF files
-- Incremental `didChange` sync (ranged edits, not full-document resends)
-- Suffix-aware dedupe: never suggests text already after the cursor
-- Divergent mid-line suggestions carry a replace-to-EOL range instead
-  of splicing into existing text
-- Documents larger than 128KB index in a background worker. Keystrokes
-  on huge files never block the completion path
-- Corrupt or truncated model files fail with an error, not a panic,
-  and a panic anywhere in Complete degrades to no suggestions rather
-  than killing the server
-- Malformed/oversized JSON-RPC frames are skipped, not fatal
-- Journal entries written before a model loads are queued and replayed
+- UTF-16 position mapping including astral characters and CRLF
+- Incremental `didChange` sync, not full-document resends
+- Never suggests text already after the cursor
+- Documents over 128KB index in a background worker
+- Corrupt models fail with an error, panics degrade to no suggestions
+- Malformed or oversized JSON-RPC frames are skipped, not fatal
 
 ### Honest limits
 
-It finishes lines and blocks and can fill a verified middle, but it
-cannot invent APIs it has never seen. What it knows is exactly what your
-corpus plus your open files contain, which is the point.
+It finishes lines and blocks it has seen before; it cannot invent APIs
+it has never seen. What it knows is exactly what your corpus and open
+files contain.
 
 ## License
 
-0BSD
+[0BSD](LICENSE)
