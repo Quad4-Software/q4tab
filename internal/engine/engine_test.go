@@ -55,12 +55,12 @@ func buildEngine(t *testing.T, cfg Config) *Engine {
 			t.Fatal(err)
 		}
 	}
-	m, li, _, err := BuildIndex([]string{dir}, 6, nil, nil)
+	bun, _, err := BuildIndex([]string{dir}, 6, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := New(cfg)
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	return e
 }
 
@@ -146,7 +146,7 @@ func TestLoadRejectsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "bad.bin")
 	os.WriteFile(p, []byte("not a model file at all, just text"), 0o644)
-	if _, _, err := Load(p); err == nil {
+	if _, err := Load(p); err == nil {
 		t.Fatal("corrupt model loaded without error")
 	}
 	// Valid magic but truncated before sections complete.
@@ -157,34 +157,35 @@ func TestLoadRejectsCorrupt(t *testing.T) {
 	binary.Write(&buf, binary.LittleEndian, uint32(10))
 	p2 := filepath.Join(dir, "bad2.bin")
 	os.WriteFile(p2, buf.Bytes(), 0o644)
-	if _, _, err := Load(p2); err == nil {
+	if _, err := Load(p2); err == nil {
 		t.Fatal("truncated model loaded without error")
 	}
 	// Valid structure but corrupted vocab offsets: must be rejected,
 	// not panic later inside Vocab.Str.
 	e := buildEngine(t, DefaultConfig())
 	good := filepath.Join(dir, "good.bin")
-	if err := Save(good, e.m, e.li); err != nil {
+	if err := Save(good, e.bundle()); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(good)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Vocab offsets start at byte 16. Set the second offset backwards.
-	data[20] = 0xFF
-	data[21] = 0xFF
-	data[22] = 0xFF
+	// v3 header is 24 bytes; vocab offsets start at byte 24. Set the
+	// second offset backwards.
+	data[28] = 0xFF
+	data[29] = 0xFF
+	data[30] = 0xFF
 	bad := filepath.Join(dir, "badoffs.bin")
 	os.WriteFile(bad, data, 0o644)
-	if _, _, err := Load(bad); err == nil {
+	if _, err := Load(bad); err == nil {
 		t.Fatal("model with corrupt offsets loaded without error")
 	}
 	// A tail-truncated v2 file must fail cleanly at load.
 	data, _ = os.ReadFile(good)
 	trunc := filepath.Join(dir, "trunc.bin")
 	os.WriteFile(trunc, data[:len(data)-64], 0o644)
-	if _, _, err := Load(trunc); err == nil {
+	if _, err := Load(trunc); err == nil {
 		t.Fatal("truncated v2 model loaded without error")
 	}
 }
@@ -199,11 +200,11 @@ func TestLearnWithoutModel(t *testing.T) {
 	// Once a model arrives the pending text must reach the cache.
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "f.go"), []byte(fixtureFiles["errcheck.go"]), 0o644)
-	m, li, _, err := BuildIndex([]string{dir}, 6, nil, nil)
+	bun, _, err := BuildIndex([]string{dir}, 6, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	if len(e.pendLearn) != 0 {
 		t.Fatal("pending learns not drained")
 	}

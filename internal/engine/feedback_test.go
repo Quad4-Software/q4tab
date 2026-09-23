@@ -19,12 +19,12 @@ func buildEngineFrom(t *testing.T, cfg Config, files map[string]string) *Engine 
 			t.Fatal(err)
 		}
 	}
-	m, li, _, err := BuildIndex([]string{dir}, 6, nil, nil)
+	bun, _, err := BuildIndex([]string{dir}, 6, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := New(cfg)
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	return e
 }
 

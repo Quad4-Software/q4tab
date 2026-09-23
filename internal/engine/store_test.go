@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"q4complete/internal/model"
 )
 
 // TestStoreRoundTrip saves and reloads a built model and verifies the
@@ -14,26 +16,27 @@ import (
 func TestStoreRoundTrip(t *testing.T) {
 	e := buildEngine(t, DefaultConfig())
 	p := filepath.Join(t.TempDir(), "m.bin")
-	if err := Save(p, e.m, e.li); err != nil {
+	if err := Save(p, e.bundle()); err != nil {
 		t.Fatal(err)
 	}
-	m2, li2, err := Load(p)
+	bun2, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m2.N != e.m.N || m2.Vocab.Len() != e.m.Vocab.Len() {
-		t.Fatalf("roundtrip mismatch: n=%d/%d vocab=%d/%d",
-			m2.N, e.m.N, m2.Vocab.Len(), e.m.Vocab.Len())
+	m2 := bun2.M
+	if m2.N != e.m.N || m2.Vocab.Len() != e.m.Vocab.Len() || m2.KN != e.m.KN {
+		t.Fatalf("roundtrip mismatch: n=%d/%d vocab=%d/%d kn=%v/%v",
+			m2.N, e.m.N, m2.Vocab.Len(), e.m.Vocab.Len(), m2.KN, e.m.KN)
 	}
-	if li2.Len() != e.li.Len() {
-		t.Fatalf("line index mismatch: %d/%d", li2.Len(), e.li.Len())
+	if bun2.Lines.Len() != e.li.Len() {
+		t.Fatalf("line index mismatch: %d/%d", bun2.Lines.Len(), e.li.Len())
 	}
 	// Spot-check vocab and a completion.
 	if got := m2.Vocab.Str(0); got != "<pad>" {
 		t.Fatalf("vocab[0] = %q", got)
 	}
 	e2 := New(DefaultConfig())
-	e2.SetModel(m2, li2)
+	e2.SetBundle(bun2)
 	text := "package demo\n\nfunc d() error {\n\terr := work()\n\tif err !="
 	a := texts(e.Complete("file:///d.go", text, len(text)))
 	b := texts(e2.Complete("file:///d.go", text, len(text)))
@@ -157,5 +160,37 @@ func TestDeltaCompletion(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("delta file line did not surface, got %q", texts(items))
+	}
+}
+
+// TestStoreEmptyOrderRoundTrip: a build that gated or froze an order to
+// zero rows writes a section with nk=0. Loading it must not panic on
+// the zero-length typed slices.
+func TestStoreEmptyOrderRoundTrip(t *testing.T) {
+	e := buildEngine(t, DefaultConfig())
+	bun := e.bundle()
+	// Empty the top order: zero keys, zero rows.
+	top := &bun.M.Orders[bun.M.N]
+	top.Keys = nil
+	top.Off = nil
+	top.Toks = nil
+	top.Cnts = nil
+	top.Totals = nil
+	top.NToks = 0
+	// Empty a lang bigram table too.
+	for _, lt := range bun.Langs {
+		lt.Bi = model.Order{}
+		break
+	}
+	p := filepath.Join(t.TempDir(), "m.bin")
+	if err := Save(p, bun); err != nil {
+		t.Fatal(err)
+	}
+	bun2, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bun2.M.Orders[bun2.M.N].Keys) != 0 {
+		t.Fatal("expected empty top order")
 	}
 }

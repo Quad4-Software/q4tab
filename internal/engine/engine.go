@@ -49,12 +49,23 @@ type Weights struct {
 	FIM    float64 `json:"fim"`    // verified fill-in-the-middle bonus
 	Model  float64 `json:"model"`  // model chain rank unit
 	FIMIdx float64 `json:"fimIdx"` // index-verified (weaker) FIM bonus
+
+	// Auxiliary-layer weights (v3 bundles).
+	LineBi float64 `json:"lineBi"` // next-line retrieval hit, per log-count
+	Struct float64 `json:"struct"` // structural-context vote on model candidates
+	Lang   float64 `json:"lang"`   // per-language table vote on model candidates
+	Sub    float64 `json:"sub"`    // synthesized identifier completion
+
+	// Learned parameters persisted alongside the weights.
+	Cal  *Calibrator `json:"cal,omitempty"`  // journal-trained rank calibrator
+	LamK []float64   `json:"lamK,omitempty"` // per-order backoff scales
 }
 
 func DefaultWeights() Weights {
 	return Weights{
 		File: 1e6, Dyn: 1e5, Learn: 2e5,
 		FIM: 4e6, FIMIdx: 3e6, Model: 1,
+		LineBi: 4e5, Struct: 2.0, Lang: 3.0, Sub: 3e5,
 	}
 }
 
@@ -129,6 +140,15 @@ type Engine struct {
 	building bool
 	bmu      sync.Mutex     // serializes drainOnce runs (worker and Flush)
 	syms     *symbols.Index // definition sites for lookup_symbol
+
+	// Auxiliary model layers from the v3 bundle. All optional; a nil
+	// field disables that layer cleanly.
+	lineBi *lines.GramIndex            // previous line(s) -> next line
+	struc  *model.Order                // lexical-context -> token counts
+	langs  map[string]*model.LangTable // per-language low-order tables
+	sub    *model.Model                // identifier subtoken model
+	idents *model.IdentIndex           // subtoken path -> ident ids
+	cal    *Calibrator                 // journal-trained rank calibrator
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -236,16 +256,59 @@ func (e *Engine) evictUsers() {
 }
 
 // SetWeights swaps the scoring weights (see `q4complete tune`).
+// A non-nil w.Cal is installed as the rank calibrator.
 func (e *Engine) SetWeights(w Weights) {
 	e.mu.Lock()
 	e.w = w
+	if w.Cal != nil {
+		e.cal = w.Cal
+	}
+	if e.m != nil && (w.LamK == nil || len(w.LamK) == e.m.N+1) {
+		e.m.LamK = w.LamK
+	}
 	e.mu.Unlock()
+}
+
+// SetCalibrator installs (or clears with nil) the journal-trained
+// rank calibrator applied at merge time.
+func (e *Engine) SetCalibrator(c *Calibrator) {
+	e.mu.Lock()
+	e.cal = c
+	e.mu.Unlock()
+}
+
+// bundle collects the installed model artifacts for saving. Callers
+// hold no lock; the fields it reads are write-once after SetBundle.
+func (e *Engine) bundle() *Bundle {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return &Bundle{
+		M: e.m, Lines: e.li, LineBi: e.lineBi, Struct: e.struc,
+		Langs: e.langs, Sub: e.sub, Idents: e.idents,
+	}
+}
+
+// SetBundle installs a loaded bundle: model, line index, and all the
+// auxiliary layers that came with it.
+func (e *Engine) SetBundle(b *Bundle) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setModelLocked(b.M, b.Lines)
+	e.lineBi = b.LineBi
+	e.struc = b.Struct
+	e.langs = b.Langs
+	e.sub = b.Sub
+	e.idents = b.Idents
 }
 
 // SetModel installs the trained artifacts.
 func (e *Engine) SetModel(m *model.Model, li *lines.Index) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.setModelLocked(m, li)
+}
+
+func (e *Engine) setModelLocked(m *model.Model, li *lines.Index) {
 	e.m = m
 	e.li = li
 	if m != nil {
@@ -614,7 +677,10 @@ func (e *Engine) journalEventLocked(kind string, it Item, rank int) {
 		Src string  `json:"s"`
 		Scr float64 `json:"v"`
 		R   int     `json:"r"`
-	}{kind, baseSource(it.Source), it.Score, rank})
+		L   int     `json:"l"`
+		M   bool    `json:"m"`
+	}{kind, baseSource(it.Source), it.Score, rank, len(it.Text),
+		strings.IndexByte(it.Text, '\n') >= 0})
 	e.jmu.Lock()
 	defer e.jmu.Unlock()
 	if e.journalF == nil {
@@ -1138,6 +1204,16 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			}
 		}
 
+		// Next-line retrieval: at a blank line or EOL, the line
+		// n-gram predicts what follows the previous line(s) verbatim.
+		for _, it := range e.lineBiItems(text, offset, linePrefix) {
+			if ok := e.accept(it.Text, ns, restN); ok && !seen[it.Text] {
+				seen[it.Text] = true
+				it.ReplaceToEOL = replace
+				items = append(items, it)
+			}
+		}
+
 		// Model generation with cache mixing.
 		if e.m != nil {
 			for _, it := range e.generate(user, uri, text, offset, linePrefix) {
@@ -1211,6 +1287,14 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 	}()
 
+	// Journal-trained calibration rescales merged candidates on their
+	// display-time features. It runs here, not inside the per-source
+	// scorers, so it sees the final blended picture.
+	if e.cal != nil {
+		for i := range items {
+			items[i].Score *= e.cal.Boost(&items[i], i)
+		}
+	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
 	if len(items) > e.cfg.MaxItems {
 		items = items[:e.cfg.MaxItems]
@@ -1363,6 +1447,14 @@ func (e *Engine) generate(user, uri, text string, offset int, linePrefix string)
 		nextLines:  nextLinesNorm(text, offset, e.cfg.MaxLines),
 		curLineRaw: curLine,
 		openExpr:   endsInOperator(linePrefix),
+		lang:       LangOf(uri),
+	}
+	if e.struc != nil {
+		var st tokenize.StructState
+		for _, t := range toks {
+			st.Advance(t)
+		}
+		o.structKey = st.Key()
 	}
 	if e.cfg.Budget > 0 {
 		o.deadline = time.Now().Add(e.cfg.Budget)
@@ -1373,7 +1465,8 @@ func (e *Engine) generate(user, uri, text string, offset int, linePrefix string)
 	// avoids repeated unpacks without a shared cache lock.
 	q := e.m.NewQuery()
 	var out []Item
-	gen := e.chain(ctx, caches, partial, o, q)
+	extra, synth := e.subCands(ctx, partial)
+	gen := e.chain(ctx, caches, partial, o, q, extra)
 	n := len(gen)
 	for i, cand := range gen {
 		if cand == "" {
@@ -1382,6 +1475,10 @@ func (e *Engine) generate(user, uri, text string, offset int, linePrefix string)
 		// Rank-scaled so a confident chain outranks a weak one.
 		out = append(out, Item{Text: cand, Source: "model",
 			Score: e.w.Model * float64(n-i)})
+	}
+	if synth != "" {
+		out = append(out, Item{Text: synth, Source: "sub",
+			Score: e.w.Sub})
 	}
 	return out
 }
@@ -1493,6 +1590,8 @@ type genOpts struct {
 	curLineRaw string // full text of the line being completed
 	openExpr   bool   // line ends mid-expression. Suppress leading newline
 	deadline   time.Time
+	lang       string // language bucket of the buffer (LangOf)
+	structKey  uint16 // lexical-context key at the cursor
 }
 
 // endsInOperator reports whether the line ends with an operator-like
@@ -1511,6 +1610,29 @@ func endsInOperator(linePrefix string) bool {
 	return strings.HasSuffix(p, "==") || strings.HasSuffix(p, "!=")
 }
 
+// TrainLamK estimates per-order backoff scales by deleted
+// interpolation over held-out texts. The scales are returned for the
+// caller to validate and install through Weights.LamK, not applied
+// here. Holdout tokens resolve by lookup only: novel strings contribute
+// no signal and must not grow the vocab.
+func (e *Engine) TrainLamK(texts []string) []float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.m == nil || !e.m.KN {
+		return nil
+	}
+	var all []uint32
+	for _, text := range texts {
+		toks := tokenize.Lex([]byte(text))
+		for _, t := range toks {
+			if id, ok := e.m.Vocab.Lookup(t); ok {
+				all = append(all, id)
+			}
+		}
+	}
+	return e.m.DeletedInterpolation(all)
+}
+
 // probFloor reads the adaptive probability floor under its leaf lock.
 func (e *Engine) probFloor() float64 {
 	e.shmu.Lock()
@@ -1521,8 +1643,9 @@ func (e *Engine) probFloor() float64 {
 // chain runs generation for the top first-token variants and returns
 // them best-first by mean log probability, so a confident chain outranks
 // a lucky one regardless of which first token it sprang from.
-func (e *Engine) chain(ctx []uint32, caches []*model.Cache, partial string, o genOpts, q *model.Query) []string {
-	first := e.candidates(ctx, caches, q)
+func (e *Engine) chain(ctx []uint32, caches []*model.Cache, partial string, o genOpts, q *model.Query, extra []model.Cand) []string {
+	first := e.candidates(ctx, caches, o, q)
+	first = append(first, extra...)
 	var filt []model.Cand
 	floor := e.probFloor()
 	for _, c := range first {
@@ -1632,7 +1755,7 @@ func (e *Engine) generateBlock(ctx []uint32, caches []*model.Cache, firstTok uin
 		if step == 0 {
 			t, p = firstTok, 1.0
 		} else {
-			cands := e.candidates(cur, caches, q)
+			cands := e.candidates(cur, caches, o, q)
 			if len(cands) == 0 {
 				break
 			}
@@ -1757,8 +1880,11 @@ func leadingWS(line string) string {
 	return line[:i]
 }
 
-// candidates merges static-model candidates with all live caches.
-func (e *Engine) candidates(ctx []uint32, caches []*model.Cache, q *model.Query) []model.Cand {
+// candidates merges static-model candidates with all live caches, then
+// applies the auxiliary vote layers: the per-language low-order tables
+// and the structural-context table each nudge candidate probabilities
+// toward what their side of the corpus says fits here.
+func (e *Engine) candidates(ctx []uint32, caches []*model.Cache, o genOpts, q *model.Query) []model.Cand {
 	static := e.m.TopUnion(ctx, e.cfg.Lam, 8, q)
 	merged := static
 	for _, c := range caches {
@@ -1768,6 +1894,39 @@ func (e *Engine) candidates(ctx []uint32, caches []*model.Cache, q *model.Query)
 		dist, tot := c.Dist(ctx)
 		merged = model.MixCandidates(merged, dist, tot, e.cfg.Gamma)
 	}
+	if len(merged) == 0 {
+		return merged
+	}
+	var lastTok uint32
+	if len(ctx) > 0 {
+		lastTok = ctx[len(ctx)-1]
+	}
+	var langDist, structDist map[uint32]float64
+	if lt := e.langs[o.lang]; lt != nil {
+		langDist = lt.Dist(lastTok, q)
+	}
+	if e.struc != nil && o.structKey != 0 {
+		if toks, cnts, tot, _, ok := e.struc.Row(uint64(o.structKey), q); ok && tot > 0 {
+			structDist = make(map[uint32]float64, len(toks))
+			for i, t := range toks {
+				structDist[uint32(t)] = float64(cnts[i]) / float64(tot)
+			}
+		}
+	}
+	if langDist == nil && structDist == nil {
+		return merged
+	}
+	for i := range merged {
+		p := merged[i].P
+		if v, ok := langDist[merged[i].Tok]; ok {
+			p *= 1 + e.w.Lang*v
+		}
+		if v, ok := structDist[merged[i].Tok]; ok {
+			p *= 1 + e.w.Struct*v
+		}
+		merged[i].P = p
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].P > merged[j].P })
 	return merged
 }
 

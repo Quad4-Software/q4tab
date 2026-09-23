@@ -5,29 +5,44 @@
 //
 // Layout (all little-endian, every array section 8-byte aligned):
 //
-//	u32 magic 'Q4C2', u32 version, u32 order, u32 vocabN
-//	u32 vocabOffs[vocabN+1], u64 vocabBlobLen, u8 vocabBlob[...]
+//	u32 magic 'Q4C3', u32 version=3, u32 order N (incl. deep orders),
+//	  u32 vocabN, u8 flags (bit0: Kneser-Ney), pad to 8
+//	u32 vocabOffs[vocabN+1], u64 vocabBlobLen, u8 vocabBlob[...], pad8
 //
-//	version 1 order section, per k in 1..N: u64 nKeys, u64 nToks,
-//	  u64 keys[nKeys], i64 off[nKeys+1], i64 totals[nKeys],
-//	  i32 toks[nToks], i32 cnts[nToks]
+//	KN models only, unigram section:
+//	  i64 uniTot, 3xf64 uniDisc, f64 uniGamma,
+//	  u32 nUniTop, i32 uniTop[nUniTop], i32 uni[vocabN]
 //
-//	version 2 order section, per k in 1..N: u64 nKeys, u64 nToks,
-//	  u64 streamLen, u64 keys[nKeys], i64 off[nKeys+1],
-//	  u8 stream[streamLen]
+//	Order sections, per k (KN: 2..N, plain: 1..N):
+//	  u64 nKeys, u64 nToks, 3xf64 disc, u64 streamLen,
+//	  u64 keys[nKeys], i64 off[nKeys+1], u8 stream[streamLen], pad8
 //	  where each row in the stream is
 //	  uvarint nToks, uvarint rowTotal, uvarint toks[n], uvarint cnts[n].
-//	  v2 folds totals/toks/cnts into varint rows, roughly halving the
-//	  order section. Keys and offsets stay flat for binary search.
 //
 //	u32 nLines, u32 linesOff[nLines+1], i32 linesCnts[nLines],
 //	  u64 linesBlobLen, u8 linesBlob[...]
+//
+//	Auxiliary sections (v3): each is a count-prefixed block, zero count
+//	means absent.
+//	  line-ngram table: u64 nKeys, u64 streamLen, u64 keys, i64 off,
+//	    stream (same row encoding, toks are line-index positions)
+//	  struct table: same shape
+//	  langs: u32 nLangs, per lang: u16 nameLen, name, then a unigram
+//	    and a bigram order section
+//	  subtoken model: u8 present; u32 subN, u32 subVocabN, vocab offs +
+//	    blob, then subN plain order sections (k=1..subN)
+//	  ident index: u32 n, u32 off[n+1], i32 ids[n], i32 freq[n],
+//	    u64 blobLen, blob
+//
+// Versions 1 and 2 (magic Q4C2) still load: v1 flat CSR arrays, v2
+// varint row streams, both without KN metadata or aux sections.
 package engine
 
 import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,16 +51,17 @@ import (
 
 	"q4complete/internal/lines"
 	"q4complete/internal/model"
+	"sort"
 )
 
 const (
-	storeMagic   = 0x51344332 // 'Q4C2'
-	storeVersion = 2          // v1 flat CSR arrays, v2 varint row streams
+	storeMagicV2 = 0x51344332 // 'Q4C2' with u32 version 1 or 2
+	storeMagic   = 0x51344333 // 'Q4C3'
+	storeVersion = 3
 )
 
-// Save writes model + line index to path atomically in the packed
-// binary format.
-func Save(path string, m *model.Model, li *lines.Index) error {
+// Save writes the bundle to path atomically in the packed binary format.
+func Save(path string, b *Bundle) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -60,60 +76,111 @@ func Save(path string, m *model.Model, li *lines.Index) error {
 		os.Remove(tmp)
 		return e
 	}
+	m := b.M
 	vblob, voffs := m.Vocab.Blob()
 	putU32(w, storeMagic)
 	putU32(w, storeVersion)
 	putU32(w, uint32(m.N))
 	putU32(w, uint32(len(voffs)-1))
+	var flags byte
+	if m.KN {
+		flags |= 1
+	}
+	w.Write([]byte{flags})
+	pad8(w)
 	putSlice(w, voffs)
 	putU64(w, uint64(len(vblob)))
 	w.Write(vblob)
 	pad8(w)
-	var vbuf [binary.MaxVarintLen64]byte
-	for k := 1; k <= m.N; k++ {
-		o := &m.Orders[k]
-		// Encode rows into a varint stream first. Row byte offsets
-		// into the stream replace the v1 CSR index arrays.
-		var stream []byte
-		offs := make([]int64, 0, len(o.Keys)+1)
-		offs = append(offs, 0)
-		var nt int64
-		for i := range o.Keys {
-			rtoks := o.Toks[o.Off[i]:o.Off[i+1]]
-			rcnts := o.Cnts[o.Off[i]:o.Off[i+1]]
-			n := binary.PutUvarint(vbuf[:], uint64(len(rtoks)))
-			stream = append(stream, vbuf[:n]...)
-			n = binary.PutUvarint(vbuf[:], uint64(o.Totals[i]))
-			stream = append(stream, vbuf[:n]...)
-			// Interleave (tok, cnt) pairs so a prefix decode is valid.
-			for j, t := range rtoks {
-				n = binary.PutUvarint(vbuf[:], uint64(uint32(t)))
-				stream = append(stream, vbuf[:n]...)
-				n = binary.PutUvarint(vbuf[:], uint64(uint32(rcnts[j])))
-				stream = append(stream, vbuf[:n]...)
-			}
-			nt += int64(len(rtoks))
-			offs = append(offs, int64(len(stream)))
-		}
-		putU64(w, uint64(len(o.Keys)))
-		putU64(w, uint64(nt))
-		putU64(w, uint64(len(stream)))
-		putSlice(w, o.Keys)
-		putSlice(w, offs)
-		w.Write(stream)
+
+	if m.KN {
+		putU64(w, uint64(m.UniTot))
+		putF64(w, m.UniDisc[0])
+		putF64(w, m.UniDisc[1])
+		putF64(w, m.UniDisc[2])
+		putF64(w, m.UniGamma)
+		putU32(w, uint32(len(m.UniTop)))
+		putSlice(w, u32toi32(m.UniTop))
+		putSlice(w, m.Uni)
 		pad8(w)
 	}
+	first := 1
+	if m.KN {
+		first = 2 // unigram lives in the flat array, not the order table
+	}
+	for k := first; k <= m.N; k++ {
+		writeOrder(w, &m.Orders[k])
+	}
+
 	var loff []uint32
 	var lcnts []int32
 	var lblob []byte
-	if li != nil {
-		loff, lcnts, lblob = li.Off, li.Cnts, li.Blob
+	if b.Lines != nil {
+		loff, lcnts, lblob = b.Lines.Off, b.Lines.Cnts, b.Lines.Blob
 	}
 	putU32(w, uint32(len(lcnts)))
 	putSlice(w, loff)
 	putSlice(w, lcnts)
 	putU64(w, uint64(len(lblob)))
 	w.Write(lblob)
+	pad8(w)
+
+	// Line n-gram table.
+	if b.LineBi != nil {
+		writeOrderSection(w, b.LineBi.Keys, b.LineBi.Off, b.LineBi.Stream, 0, [3]float64{})
+	} else {
+		writeOrderSection(w, nil, nil, nil, 0, [3]float64{})
+	}
+	// Structural-context table.
+	writeOrder(w, b.Struct)
+
+	// Per-language tables.
+	names := make([]string, 0, len(b.Langs))
+	for name := range b.Langs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	putU32(w, uint32(len(names)))
+	for _, name := range names {
+		lt := b.Langs[name]
+		putU16(w, uint16(len(name)))
+		w.Write([]byte(name))
+		writeOrder(w, &lt.Uni)
+		writeOrder(w, &lt.Bi)
+	}
+
+	// Subtoken model: a plain (raw-count) model with its own vocab.
+	if b.Sub != nil {
+		w.Write([]byte{1})
+		pad8(w)
+		sb := b.Sub
+		svblob, svoffs := sb.Vocab.Blob()
+		putU32(w, uint32(sb.N))
+		putU32(w, uint32(len(svoffs)-1))
+		putSlice(w, svoffs)
+		putU64(w, uint64(len(svblob)))
+		w.Write(svblob)
+		pad8(w)
+		for k := 1; k <= sb.N; k++ {
+			writeOrder(w, &sb.Orders[k])
+		}
+	} else {
+		w.Write([]byte{0})
+		pad8(w)
+	}
+
+	// Identifier index.
+	if b.Idents != nil {
+		ix := b.Idents
+		putU32(w, uint32(len(ix.Ids)))
+		putSlice(w, ix.Off)
+		putSlice(w, ix.Ids)
+		putSlice(w, ix.Freq)
+		putU64(w, uint64(len(ix.Blob)))
+		w.Write(ix.Blob)
+	} else {
+		putU32(w, 0)
+	}
 	if w.err != nil {
 		return fail(w.err)
 	}
@@ -124,52 +191,319 @@ func Save(path string, m *model.Model, li *lines.Index) error {
 	return os.Rename(tmp, path)
 }
 
+// writeOrder emits one order section. In-memory orders (fresh builds)
+// are encoded to the varint row stream first; already-packed orders
+// (loaded models being re-saved) copy through.
+func writeOrder(w *countingWriter, o *model.Order) {
+	if o == nil {
+		writeOrderSection(w, nil, nil, nil, 0, [3]float64{})
+		return
+	}
+	if o.Stream != nil {
+		writeOrderSection(w, o.Keys, o.Off, o.Stream, o.NToks, o.Disc)
+		return
+	}
+	var stream []byte
+	offs := make([]int64, 0, len(o.Keys)+1)
+	offs = append(offs, 0)
+	var vbuf [binary.MaxVarintLen64]byte
+	var nt int64
+	for i := range o.Keys {
+		rtoks := o.Toks[o.Off[i]:o.Off[i+1]]
+		rcnts := o.Cnts[o.Off[i]:o.Off[i+1]]
+		n := binary.PutUvarint(vbuf[:], uint64(len(rtoks)))
+		stream = append(stream, vbuf[:n]...)
+		n = binary.PutUvarint(vbuf[:], uint64(o.Totals[i]))
+		stream = append(stream, vbuf[:n]...)
+		for j, t := range rtoks {
+			n = binary.PutUvarint(vbuf[:], uint64(uint32(t)))
+			stream = append(stream, vbuf[:n]...)
+			n = binary.PutUvarint(vbuf[:], uint64(uint32(rcnts[j])))
+			stream = append(stream, vbuf[:n]...)
+		}
+		nt += int64(len(rtoks))
+		offs = append(offs, int64(len(stream)))
+	}
+	writeOrderSection(w, o.Keys, offs, stream, nt, o.Disc)
+}
+
+// writeOrderSection writes keys + row-offset + stream with the v3
+// discount header (all zero for tables that do not use KN).
+func writeOrderSection(w *countingWriter, keys []uint64, off []int64, stream []byte, ntoks int64, disc [3]float64) {
+	putU64(w, uint64(len(keys)))
+	putU64(w, uint64(ntoks))
+	putF64(w, disc[0])
+	putF64(w, disc[1])
+	putF64(w, disc[2])
+	putU64(w, uint64(len(stream)))
+	putSlice(w, keys)
+	putSlice(w, off)
+	w.Write(stream)
+	pad8(w)
+}
+
+// readOrderSection reads one v2/v3 order section into stream form.
+// ver selects the encoding: v1 is flat CSR (handled by the caller),
+// v2/v3 are varint row streams. v3 sections carry a 3xf64 discount
+// header that v2 lacks.
+func readOrderSection(r *reader, disc bool) (*model.Order, error) {
+	nk := int(r.u64())
+	nt := int(r.u64())
+	var d [3]float64
+	if disc {
+		d[0] = r.f64()
+		d[1] = r.f64()
+		d[2] = r.f64()
+	}
+	slen := int(r.u64())
+	if nk < 0 || nk > 1<<31 || nt < 0 || nt > 1<<33 || slen < 0 || slen > 1<<33 {
+		return nil, fmt.Errorf("model: absurd order sizes nk=%d nt=%d slen=%d", nk, nt, slen)
+	}
+	o := &model.Order{Disc: d}
+	o.Keys = r.u64s(nk)
+	o.Off = r.i64s(nk + 1)
+	o.Stream = r.bytes(slen)
+	o.NToks = int64(nt)
+	r.align8()
+	if r.err != nil {
+		return nil, fmt.Errorf("model: truncated order section")
+	}
+	if nk == 0 {
+		if slen != 0 {
+			return nil, fmt.Errorf("model: empty order with stream")
+		}
+		return o, nil
+	}
+	if len(o.Off) != nk+1 || len(o.Stream) != slen || !validOffs64(o.Off, slen) {
+		return nil, fmt.Errorf("model: corrupt order section")
+	}
+	return o, nil
+}
+
 // Load reads the packed model file. It mmaps the file read-only so the
-// CSR arrays stay on disk until touched. Falls back to a plain read when
+// tables stay on disk until touched. Falls back to a plain read when
 // mmap is unavailable (non-unix or tiny files).
-func Load(path string) (*model.Model, *lines.Index, error) {
+func Load(path string) (*Bundle, error) {
 	data, mapped, err := mapFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if os.Getenv("Q4_DEBUG_RSS") != "" {
 		fmt.Fprintf(os.Stderr, "post-map: %s\n", rssDebug())
 	}
 	r := &reader{b: data}
 	magic := r.u32()
+	if magic == storeMagicV2 {
+		return loadV12(r, data, mapped)
+	}
+	if magic != storeMagic {
+		return nil, fmt.Errorf("model: bad magic %x (old gob format? rebuild the index)", magic)
+	}
 	ver := r.u32()
 	n := int(r.u32())
 	vn := int(r.u32())
-	if magic != storeMagic {
-		return nil, nil, fmt.Errorf("model: bad magic %x (old gob format? rebuild the index)", magic)
+	flags := r.bytes(1)
+	r.align8()
+	if ver != storeVersion {
+		return nil, fmt.Errorf("model: unsupported version %d", ver)
 	}
+	if n < 1 || n > 16 || vn < 0 || vn > 1<<27 {
+		return nil, fmt.Errorf("model: bad header order=%d vocab=%d", n, vn)
+	}
+	kn := len(flags) > 0 && flags[0]&1 != 0
+	voffs := r.u32s(vn + 1)
+	vlen := r.u64()
+	vblob := r.bytes(int(vlen))
+	r.align8()
+	if r.err != nil || len(voffs) != vn+1 || len(vblob) != int(vlen) {
+		return nil, fmt.Errorf("model: truncated vocab section")
+	}
+	if !validOffs32(voffs, len(vblob)) {
+		return nil, fmt.Errorf("model: corrupt vocab offsets")
+	}
+	v := model.VocabFromBlob(vblob, voffs)
+	m := &model.Model{Vocab: v, N: n, KN: kn}
+	m.Orders = make([]model.Order, n+1)
+
+	if kn {
+		m.UniTot = int64(r.u64())
+		m.UniDisc[0] = r.f64()
+		m.UniDisc[1] = r.f64()
+		m.UniDisc[2] = r.f64()
+		m.UniGamma = r.f64()
+		ntop := int(r.u32())
+		if ntop < 0 || ntop > 1<<20 {
+			return nil, fmt.Errorf("model: bad unigram top %d", ntop)
+		}
+		top32 := r.i32s(ntop)
+		m.UniTop = make([]uint32, len(top32))
+		for i, t := range top32 {
+			m.UniTop[i] = uint32(t)
+		}
+		m.Uni = r.i32s(vn)
+		r.align8()
+		if r.err != nil || len(m.Uni) != vn {
+			return nil, fmt.Errorf("model: truncated unigram section")
+		}
+	}
+	first := 1
+	if kn {
+		first = 2
+	}
+	for k := first; k <= n; k++ {
+		o, err := readOrderSection(r, true)
+		if err != nil {
+			return nil, fmt.Errorf("model: order %d: %w", k, err)
+		}
+		m.Orders[k] = *o
+	}
+	// Remaining sections are optional: a truncated tail degrades to a
+	// smaller bundle rather than a hard error only when the required
+	// parts are already sound. Line index is required.
+	nl := int(r.u32())
+	if r.err != nil {
+		return nil, fmt.Errorf("model: truncated line index header")
+	}
+	bun := &Bundle{M: m}
+	if nl > 0 {
+		loff := r.u32s(nl + 1)
+		lcnts := r.i32s(nl)
+		llen := r.u64()
+		lblob := r.bytes(int(llen))
+		if r.err != nil {
+			return nil, fmt.Errorf("model: truncated line index")
+		}
+		if len(loff) != nl+1 || len(lcnts) != nl || !validOffs32(loff, len(lblob)) {
+			return nil, fmt.Errorf("model: corrupt line index")
+		}
+		bun.Lines = &lines.Index{Blob: lblob, Off: loff, Cnts: lcnts}
+	}
+	r.align8()
+	// Aux sections: absent (end of file) is fine, but a section that
+	// starts and then truncates is corrupt, not degraded.
+	hasAux := func() bool { return r.err == nil && r.off < len(r.b) }
+	if hasAux() {
+		o, err := readOrderSection(r, true)
+		if err != nil {
+			return nil, fmt.Errorf("model: line-gram section: %w", err)
+		}
+		if len(o.Keys) > 0 {
+			bun.LineBi = &lines.GramIndex{Keys: o.Keys, Off: o.Off, Stream: o.Stream}
+		}
+	}
+	if hasAux() {
+		o, err := readOrderSection(r, true)
+		if err != nil {
+			return nil, fmt.Errorf("model: struct section: %w", err)
+		}
+		if len(o.Keys) > 0 {
+			bun.Struct = o
+		}
+	}
+	if hasAux() {
+		nl := int(r.u32())
+		if nl < 0 || nl > 128 || r.err != nil {
+			return nil, fmt.Errorf("model: bad langs section")
+		}
+		bun.Langs = map[string]*model.LangTable{}
+		for i := 0; i < nl; i++ {
+			nlen := int(r.u16())
+			name := string(r.bytes(nlen))
+			uni, e1 := readOrderSection(r, true)
+			bi, e2 := readOrderSection(r, true)
+			if e1 != nil || e2 != nil || r.err != nil {
+				return nil, fmt.Errorf("model: lang %q section: %v %v", name, e1, e2)
+			}
+			lt := &model.LangTable{Uni: *uni, Bi: *bi}
+			bun.Langs[name] = lt
+		}
+	}
+	if hasAux() {
+		p := r.bytes(1)
+		if len(p) != 1 || r.err != nil {
+			return nil, fmt.Errorf("model: truncated subtoken flag")
+		}
+		if p[0] == 1 {
+			r.align8()
+			subN := int(r.u32())
+			subVN := int(r.u32())
+			if subN < 1 || subN > 8 || subVN <= 0 || subVN > 1<<27 {
+				return nil, fmt.Errorf("model: bad subtoken header n=%d vocab=%d", subN, subVN)
+			}
+			svoffs := r.u32s(subVN + 1)
+			svlen := r.u64()
+			svblob := r.bytes(int(svlen))
+			r.align8()
+			if r.err != nil || len(svoffs) != subVN+1 || !validOffs32(svoffs, len(svblob)) {
+				return nil, fmt.Errorf("model: corrupt subtoken vocab")
+			}
+			sub := &model.Model{Vocab: model.VocabFromBlob(svblob, svoffs), N: subN}
+			sub.Orders = make([]model.Order, subN+1)
+			for k := 1; k <= subN; k++ {
+				o, err := readOrderSection(r, true)
+				if err != nil {
+					return nil, fmt.Errorf("model: subtoken order %d: %w", k, err)
+				}
+				sub.Orders[k] = *o
+			}
+			bun.Sub = sub
+		}
+	}
+	if hasAux() {
+		ni := int(r.u32())
+		if ni < 0 || ni > 1<<24 || r.err != nil {
+			return nil, fmt.Errorf("model: bad ident index header")
+		}
+		if ni > 0 {
+			ioff := r.u32s(ni + 1)
+			iids := r.i32s(ni)
+			ifreq := r.i32s(ni)
+			ilen := r.u64()
+			iblob := r.bytes(int(ilen))
+			if r.err != nil || len(ioff) != ni+1 || !validOffs32(ioff, len(iblob)) {
+				return nil, fmt.Errorf("model: corrupt ident index")
+			}
+			bun.Idents = &model.IdentIndex{Off: ioff, Blob: iblob, Ids: iids, Freq: ifreq}
+		}
+	}
+	_ = mapped
+	if os.Getenv("Q4_DEBUG_RSS") != "" {
+		fmt.Fprintf(os.Stderr, "post-load: %s\n", rssDebug())
+	}
+	return bun, nil
+}
+
+// loadV12 reads the legacy v1/v2 format: magic Q4C2 already consumed.
+// These models carry no KN metadata or aux sections; the scorer falls
+// back to Jelinek-Mercer.
+func loadV12(r *reader, data []byte, mapped bool) (*Bundle, error) {
+	ver := r.u32()
+	n := int(r.u32())
+	vn := int(r.u32())
 	if ver != 1 && ver != 2 {
-		return nil, nil, fmt.Errorf("model: unsupported version %d", ver)
+		return nil, fmt.Errorf("model: unsupported version %d", ver)
 	}
 	if n < 1 || n > 16 {
-		return nil, nil, fmt.Errorf("model: bad order %d", n)
+		return nil, fmt.Errorf("model: bad order %d", n)
 	}
 	voffs := r.u32s(vn + 1)
 	vlen := r.u64()
 	vblob := r.bytes(int(vlen))
 	r.align8()
 	if r.err != nil || len(voffs) != vn+1 || len(vblob) != int(vlen) {
-		return nil, nil, fmt.Errorf("model: truncated vocab section")
+		return nil, fmt.Errorf("model: truncated vocab section")
 	}
 	if !validOffs32(voffs, len(vblob)) {
-		return nil, nil, fmt.Errorf("model: corrupt vocab offsets")
+		return nil, fmt.Errorf("model: corrupt vocab offsets")
 	}
 	v := model.VocabFromBlob(vblob, voffs)
-	if os.Getenv("Q4_DEBUG_RSS") != "" {
-		fmt.Fprintf(os.Stderr, "post-vocab: %s\n", rssDebug())
-	}
 	m := &model.Model{Vocab: v, N: n}
 	m.Orders = make([]model.Order, n+1)
 	for k := 1; k <= n; k++ {
 		nk := int(r.u64())
 		nt := int(r.u64())
 		if nk < 0 || nk > 1<<31 || nt < 0 || nt > 1<<33 {
-			return nil, nil, fmt.Errorf("model: absurd order %d sizes", k)
+			return nil, fmt.Errorf("model: absurd order %d sizes", k)
 		}
 		o := &m.Orders[k]
 		if ver == 1 {
@@ -181,30 +515,27 @@ func Load(path string) (*model.Model, *lines.Index, error) {
 			o.NToks = int64(nt)
 			r.align8()
 			if r.err != nil {
-				return nil, nil, fmt.Errorf("model: truncated order %d", k)
+				return nil, fmt.Errorf("model: truncated order %d", k)
 			}
 			if len(o.Off) != nk+1 || len(o.Totals) != nk ||
 				len(o.Toks) != nt || len(o.Cnts) != nt ||
 				!validOffs64(o.Off, nt) {
-				return nil, nil, fmt.Errorf("model: corrupt order %d", k)
+				return nil, fmt.Errorf("model: corrupt order %d", k)
 			}
-			// Check the head and tail totals only. A full scan would
-			// fault the whole array into RSS for a corruption mode
-			// that degrades suggestions but cannot crash.
 			for _, t := range o.Totals[:min(64, nk)] {
 				if t < 0 {
-					return nil, nil, fmt.Errorf("model: negative total in order %d", k)
+					return nil, fmt.Errorf("model: negative total in order %d", k)
 				}
 			}
 			for _, t := range o.Totals[max(0, nk-64):] {
 				if t < 0 {
-					return nil, nil, fmt.Errorf("model: negative total in order %d", k)
+					return nil, fmt.Errorf("model: negative total in order %d", k)
 				}
 			}
 		} else {
 			slen := int(r.u64())
 			if slen < 0 || slen > 1<<33 {
-				return nil, nil, fmt.Errorf("model: absurd stream len in order %d", k)
+				return nil, fmt.Errorf("model: absurd stream len in order %d", k)
 			}
 			o.Keys = r.u64s(nk)
 			o.Off = r.i64s(nk + 1)
@@ -212,43 +543,35 @@ func Load(path string) (*model.Model, *lines.Index, error) {
 			o.NToks = int64(nt)
 			r.align8()
 			if r.err != nil {
-				return nil, nil, fmt.Errorf("model: truncated order %d", k)
+				return nil, fmt.Errorf("model: truncated order %d", k)
 			}
 			if len(o.Off) != nk+1 || len(o.Stream) != slen ||
 				!validOffs64(o.Off, slen) {
-				return nil, nil, fmt.Errorf("model: corrupt order %d", k)
+				return nil, fmt.Errorf("model: corrupt order %d", k)
 			}
-		}
-		if os.Getenv("Q4_DEBUG_RSS") != "" {
-			fmt.Fprintf(os.Stderr, "order %d (nk=%d nt=%d): %s\n", k, nk, nt, rssDebug())
 		}
 	}
 	nl := int(r.u32())
 	if r.err != nil {
-		return nil, nil, fmt.Errorf("model: truncated line index header")
+		return nil, fmt.Errorf("model: truncated line index header")
 	}
-	var li *lines.Index
+	bun := &Bundle{M: m}
 	if nl > 0 {
 		loff := r.u32s(nl + 1)
 		lcnts := r.i32s(nl)
 		llen := r.u64()
 		lblob := r.bytes(int(llen))
 		if r.err != nil {
-			return nil, nil, fmt.Errorf("model: truncated line index")
+			return nil, fmt.Errorf("model: truncated line index")
 		}
 		if len(loff) != nl+1 || len(lcnts) != nl ||
 			!validOffs32(loff, len(lblob)) {
-			return nil, nil, fmt.Errorf("model: corrupt line index")
+			return nil, fmt.Errorf("model: corrupt line index")
 		}
-		li = &lines.Index{Blob: lblob, Off: loff, Cnts: lcnts}
+		bun.Lines = &lines.Index{Blob: lblob, Off: loff, Cnts: lcnts}
 	}
-	// Touch nothing else. `data` (mapped or read) stays referenced by
-	// the returned structures. mapped is kept alive by the slices.
 	_ = mapped
-	if os.Getenv("Q4_DEBUG_RSS") != "" {
-		fmt.Fprintf(os.Stderr, "post-load: %s\n", rssDebug())
-	}
-	return m, li, nil
+	return bun, nil
 }
 
 const deltaMagic = 0x51344431 // 'Q4D1'
@@ -452,10 +775,28 @@ func putU32(w *countingWriter, v uint32) {
 	w.Write(b[:])
 }
 
+func putU16(w *countingWriter, v uint16) {
+	var b [2]byte
+	binary.LittleEndian.PutUint16(b[:], v)
+	w.Write(b[:])
+}
+
 func putU64(w *countingWriter, v uint64) {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
 	w.Write(b[:])
+}
+
+func putF64(w *countingWriter, v float64) {
+	putU64(w, math.Float64bits(v))
+}
+
+func u32toi32(s []uint32) []int32 {
+	out := make([]int32, len(s))
+	for i, v := range s {
+		out[i] = int32(v)
+	}
+	return out
 }
 
 func putSlice[T uint64 | int64 | int32 | uint32](w *countingWriter, s []T) {
@@ -501,12 +842,24 @@ func (r *reader) u32() uint32 {
 	return binary.LittleEndian.Uint32(p)
 }
 
+func (r *reader) u16() uint16 {
+	p := r.take(2)
+	if p == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(p)
+}
+
 func (r *reader) u64() uint64 {
 	p := r.take(8)
 	if p == nil {
 		return 0
 	}
 	return binary.LittleEndian.Uint64(p)
+}
+
+func (r *reader) f64() float64 {
+	return math.Float64frombits(r.u64())
 }
 
 func (r *reader) bytes(n int) []byte { return r.take(n) }
@@ -518,6 +871,9 @@ func (r *reader) bytes(n int) []byte { return r.take(n) }
 func (r *reader) u64s(n int) []uint64 {
 	p := r.take(8 * n)
 	if p == nil {
+		return nil
+	}
+	if len(p) == 0 {
 		return nil
 	}
 	if addr := uintptr(unsafe.Pointer(&p[0])); addr%8 == 0 {
@@ -533,6 +889,9 @@ func (r *reader) u64s(n int) []uint64 {
 func (r *reader) i64s(n int) []int64 {
 	p := r.take(8 * n)
 	if p == nil {
+		return nil
+	}
+	if len(p) == 0 {
 		return nil
 	}
 	if addr := uintptr(unsafe.Pointer(&p[0])); addr%8 == 0 {
@@ -553,6 +912,9 @@ func (r *reader) i32s(n int) []int32 {
 	if p == nil {
 		return nil
 	}
+	if len(p) == 0 {
+		return nil
+	}
 	if addr := uintptr(unsafe.Pointer(&p[0])); addr%4 == 0 {
 		return unsafe.Slice((*int32)(unsafe.Pointer(&p[0])), n)
 	}
@@ -566,6 +928,9 @@ func (r *reader) i32s(n int) []int32 {
 func (r *reader) u32s(n int) []uint32 {
 	p := r.take(4 * n)
 	if p == nil {
+		return nil
+	}
+	if len(p) == 0 {
 		return nil
 	}
 	if addr := uintptr(unsafe.Pointer(&p[0])); addr%4 == 0 {

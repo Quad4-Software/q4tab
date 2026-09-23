@@ -3,12 +3,12 @@ package engine
 import "testing"
 
 func benchEngine(b *testing.B) *Engine {
-	m, li, err := Load("../../bin/model.bin")
+	bun, err := Load("../../bin/model.bin")
 	if err != nil {
 		b.Skip(err)
 	}
 	e := New(DefaultConfig())
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	return e
 }
 
