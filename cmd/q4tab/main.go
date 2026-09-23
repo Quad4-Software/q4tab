@@ -253,13 +253,19 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 	log("best hit@1=%.1f%% -> wrote %s: %s", bestScore, out, data)
 }
 
+// version is stamped at release time via -ldflags -X main.version.
+var version = "dev"
+
 func main() {
 	log := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: q4tab <serve|index|collect|complete|stats|commitmsg> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: q4tab <serve|index|collect|complete|stats|commitmsg|version> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "version", "-version", "--version":
+		fmt.Println(version)
+		return
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		listen := fs.String("listen", "", "serve LSP over TCP on addr (e.g. 127.0.0.1:7917)")
@@ -348,7 +354,7 @@ func main() {
 		}
 
 	case "mcp":
-		// MCP stdio server for agent clients (Claude Code, Cursor, etc).
+		// MCP stdio server for agent clients.
 		// NDJSON framing: one JSON-RPC message per line.
 		fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 		fs.Parse(os.Args[2:])
