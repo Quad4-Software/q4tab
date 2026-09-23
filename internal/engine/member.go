@@ -19,6 +19,7 @@ import (
 // facts is the per-source extraction result.
 type facts struct {
 	recv  map[string]string            // var or receiver ident -> type name
+	elem  map[string]string            // var -> element type of a map/slice/array decl
 	tyMem map[string]map[string]bool   // type -> member ("Name(" = method, "Name" = field)
 	tyFld map[string]map[string]string // type -> field name -> field type
 	callM map[string]map[string]int    // func name -> member invoked on its result
@@ -29,6 +30,7 @@ type facts struct {
 func newFacts() *facts {
 	return &facts{
 		recv:  map[string]string{},
+		elem:  map[string]string{},
 		tyMem: map[string]map[string]bool{},
 		tyFld: map[string]map[string]string{},
 		callM: map[string]map[string]int{},
@@ -45,6 +47,9 @@ func (f *facts) merge(o *facts) {
 	}
 	for k, v := range o.recv {
 		f.recv[k] = v
+	}
+	for k, v := range o.elem {
+		f.elem[k] = v
 	}
 	for t, ms := range o.tyMem {
 		m := f.tyMem[t]
@@ -217,14 +222,35 @@ func extractFactsToks(toks []string) *facts {
 			}
 			f.decls[name] = true
 			k := nonWS(toks, j+1)
-			if atTok(toks, k) != "struct" {
-				continue
+			switch atTok(toks, k) {
+			case "struct":
+				k = nonWS(toks, k+1)
+				if atTok(toks, k) != "{" {
+					continue
+				}
+				i = scanStructFields(toks, k, name, f)
+			case "interface":
+				// type T interface { M(...) }: methods are members.
+				k = nonWS(toks, k+1)
+				if atTok(toks, k) == "{" {
+					scanTypeBody(toks, k+1, name, f)
+				}
 			}
-			k = nonWS(toks, k+1)
-			if atTok(toks, k) != "{" {
-				continue
+		case "class", "interface":
+			// TS/Python/Java shape: class C { m() } / class C: def m.
+			j := nonWS(toks, i+1)
+			if name := atTok(toks, j); identTok(name) {
+				f.decls[name] = true
+				scanTypeBody(toks, j+1, name, f)
 			}
-			i = scanStructFields(toks, k, name, f)
+		case "def", "function":
+			// Python def / JS-TS function: name is a decl, params may
+			// carry annotations, "-> T" is the result type.
+			j := nonWS(toks, i+1)
+			if n := atTok(toks, j); identTok(n) {
+				f.decls[n] = true
+			}
+			scanParams(toks, i, f)
 		case "var", "const":
 			j := nonWS(toks, i+1)
 			v := atTok(toks, j)
@@ -236,42 +262,50 @@ func extractFactsToks(toks []string) *facts {
 			if atTok(toks, k) == "=" {
 				// var x = NewT(...)
 				k = nonWS(toks, k+1)
-				cand := atTok(toks, k)
-				if k2 := nonWS(toks, k+1); atTok(toks, k2) == "." {
-					k = nonWS(toks, k2+1)
-					cand = atTok(toks, k)
-				}
-				if strings.HasPrefix(cand, "New") && len(cand) > 3 &&
-					atTok(toks, nonWS(toks, k+1)) == "(" {
-					f.recv[v] = cand[3:]
-				}
+				f.assignedType(v, toks, k)
 				continue
 			}
 			if atTok(toks, k) == "*" {
 				k = nonWS(toks, k+1)
 			}
-			if ty := atTok(toks, k); identTok(ty) && !tokenize.IsKeywordish(ty) {
+			ty := atTok(toks, k)
+			switch {
+			case ty == "[":
+				// var s []T: container, record the element type.
+				if e := matchBracket(toks, k); e > 0 {
+					if el := atTok(toks, nonWS(toks, e+1)); identTok(el) && !builtinType(el) {
+						f.elem[v] = el
+					}
+				}
+			case ty == "map" || ty == "chan":
+				// Container decl: the element or value type is the
+				// last ident on the line.
+				if el := lastTypeIdent(toks, k); el != "" {
+					f.elem[v] = el
+				}
+			case identTok(ty) && !tokenize.IsKeywordish(ty):
 				f.recv[v] = ty
 			}
+		case "for":
+			scanRange(toks, i, f)
 		default:
-			// x := NewT( / x = pkg.NewT( / var x = NewT(
-			if identTok(t) {
-				j := nonWS(toks, i+1)
-				op := atTok(toks, j)
-				if op != ":=" && op != "=" {
-					continue
-				}
-				k := nonWS(toks, j+1)
-				cand := atTok(toks, k)
-				if k2 := nonWS(toks, k+1); atTok(toks, k2) == "." {
-					k = nonWS(toks, k2+1)
-					cand = atTok(toks, k)
-				}
-				if strings.HasPrefix(cand, "New") && len(cand) > 3 &&
-					atTok(toks, nonWS(toks, k+1)) == "(" {
-					f.recv[t] = cand[3:]
-				}
+			// x := NewT( / x = pkg.NewT( / x: T annotation
+			if !identTok(t) {
+				continue
 			}
+			j := nonWS(toks, i+1)
+			op := atTok(toks, j)
+			if op == ":" {
+				// TS/Python annotation: "u: User", "x: int".
+				if ty := atTok(toks, nonWS(toks, j+1)); identTok(ty) && !builtinType(ty) {
+					f.recv[t] = ty
+				}
+				continue
+			}
+			if op != ":=" && op != "=" {
+				continue
+			}
+			f.assignedType(t, toks, nonWS(toks, j+1))
 		}
 	}
 	return f
@@ -304,6 +338,214 @@ func recvDecl(toks []string, open int) (name, typ string, end int) {
 		return ids[0], ids[1], end
 	}
 	return "", "", 0
+}
+
+// matchBracket returns the index of the "]" matching the "[" at
+// open, or -1 within a short bound.
+func matchBracket(toks []string, open int) int {
+	depth := 0
+	for i := open; i < len(toks) && i < open+64; i++ {
+		switch toks[i] {
+		case "[":
+			depth++
+		case "]":
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// lastTypeIdent returns the last non-builtin ident before the decl
+// ends (newline, "=", "{", ",", ";"): for "map[string]*Session" it
+// is Session, for "chan error" it is empty.
+func lastTypeIdent(toks []string, i int) string {
+	last := ""
+	for ; i < len(toks); i++ {
+		t := toks[i]
+		if t == tokenize.NL || t == "{" || t == ";" || t == "=" || t == "," {
+			return last
+		}
+		if identTok(t) && !builtinType(t) {
+			last = t
+		}
+	}
+	return last
+}
+
+// assignedType records the type of "v := expr" / "v = expr" starting
+// at the expression token index k: NewT and other capitalized calls,
+// &T{ and T{ literals, make/map/slice containers (element type),
+// and JS "new T(".
+func (f *facts) assignedType(v string, toks []string, k int) {
+	cand := atTok(toks, k)
+	switch cand {
+	case "&", "new":
+		if ty := atTok(toks, nonWS(toks, k+1)); identTok(ty) && !builtinType(ty) {
+			f.recv[v] = ty
+		}
+		return
+	case "[":
+		if e := matchBracket(toks, k); e > 0 {
+			if el := atTok(toks, nonWS(toks, e+1)); identTok(el) && !builtinType(el) {
+				f.elem[v] = el
+			}
+		}
+		return
+	case "map", "make":
+		if el := lastTypeIdent(toks, k); el != "" {
+			f.elem[v] = el
+		}
+		return
+	}
+	// pkg.Ctor(...): skip the package qualifier.
+	if k2 := nonWS(toks, k+1); atTok(toks, k2) == "." {
+		k = nonWS(toks, k2+1)
+		cand = atTok(toks, k)
+	}
+	if strings.HasPrefix(cand, "New") && len(cand) > 3 &&
+		atTok(toks, nonWS(toks, k+1)) == "(" {
+		f.recv[v] = cand[3:]
+		return
+	}
+	if cand == "" {
+		return
+	}
+	next := atTok(toks, nonWS(toks, k+1))
+	// Any capitalized call is a constructor in most languages:
+	// Session(...), Queue(), ReadCloser(...
+	if cand[0] >= 'A' && cand[0] <= 'Z' && next == "(" {
+		f.recv[v] = cand
+		return
+	}
+	// x := T{ composite literal.
+	if identTok(cand) && !builtinType(cand) && next == "{" {
+		f.recv[v] = cand
+	}
+}
+
+// resolveChain resolves a dotted ident chain against this fact set:
+// head via recv/elem, each link via tyFld. Field types already hold
+// the element type of container fields.
+func (f *facts) resolveChain(expr []string) string {
+	if len(expr) == 0 {
+		return ""
+	}
+	typ := f.recv[expr[0]]
+	if typ == "" {
+		typ = f.elem[expr[0]]
+	}
+	for _, link := range expr[1:] {
+		if typ == "" {
+			return ""
+		}
+		nt := ""
+		if row := f.tyFld[typ]; row != nil {
+			nt = row[link]
+		}
+		if nt == "" {
+			return ""
+		}
+		typ = nt
+	}
+	return typ
+}
+
+// rangeExpr resolves the ranged-over expression starting at token i
+// and binds the value name to its element type.
+func (f *facts) rangeExpr(toks []string, i int, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	var expr []string
+	lastClose := false
+	for ; i < len(toks); i++ {
+		t := toks[i]
+		if t == tokenize.NL || t == "{" || t == ":" || t == ";" {
+			break
+		}
+		if identTok(t) {
+			expr = append(expr, t)
+		} else if t == ")" {
+			lastClose = true
+		}
+	}
+	typ := ""
+	if lastClose && len(expr) > 0 {
+		// range f(): the result type already unwraps containers.
+		typ = f.retT[expr[len(expr)-1]]
+	} else {
+		typ = f.resolveChain(expr)
+	}
+	if typ != "" {
+		f.recv[names[len(names)-1]] = typ
+	}
+}
+
+// scanRange handles "for k, v := range expr" and python "for x in
+// expr": the value name gets the container's element type.
+func scanRange(toks []string, fi int, f *facts) {
+	var names []string
+	for j := nonWS(toks, fi+1); j < len(toks); j++ {
+		t := toks[j]
+		if t == tokenize.NL || t == "{" {
+			return
+		}
+		if t == "in" && len(names) > 0 {
+			f.rangeExpr(toks, nonWS(toks, j+1), names[len(names)-1:])
+			return
+		}
+		if t == ":=" || t == "=" {
+			j = nonWS(toks, j+1)
+			if atTok(toks, j) == "range" {
+				j = nonWS(toks, j+1)
+			}
+			f.rangeExpr(toks, j, names)
+			return
+		}
+		if identTok(t) {
+			names = append(names, t)
+		}
+	}
+}
+
+// scanTypeBody collects member names inside a class/interface body:
+// "def m(", "m(", and "name :" / "name ;" fields, for both brace
+// bodies and indent bodies (stops at the next top-level class).
+func scanTypeBody(toks []string, i int, name string, f *facts) {
+	depth := 0
+	for ; i < len(toks); i++ {
+		t := toks[i]
+		switch t {
+		case "{":
+			depth++
+		case "}":
+			depth--
+			if depth <= 0 {
+				return
+			}
+		case "class", "interface":
+			if depth == 0 {
+				return // indent-style body ended at the next decl
+			}
+		case "def":
+			if n := atTok(toks, nonWS(toks, i+1)); identTok(n) {
+				f.addMem(name, n, true)
+			}
+		default:
+			if !identTok(t) || tokenize.IsKeywordish(t) {
+				continue
+			}
+			switch atTok(toks, nonWS(toks, i+1)) {
+			case "(":
+				f.addMem(name, t, true)
+			case ":", ";", ",", "?", "=":
+				f.addMem(name, t, false)
+			}
+		}
+	}
 }
 
 // matchParen returns the index of the ")" matching the "(" at open,
@@ -394,8 +636,8 @@ func scanParams(toks []string, fi int, f *facts) {
 		case ",":
 			pending = pending[:0]
 		case tokenize.NL, tokenize.WS:
-		case "*", "[":
-			// Pointer or slice marker before the type ident.
+		case "*":
+			// Pointer marker before the type ident.
 		default:
 			if !identTok(t) {
 				pending = pending[:0]
@@ -410,14 +652,51 @@ func scanParams(toks []string, fi int, f *facts) {
 				pending = append(pending, t)
 				continue
 			}
+			if nt == ":" {
+				// Annotation style: "u: User", "x: int".
+				ty := atTok(toks, nonWS(toks, j+1))
+				if identTok(ty) && !builtinType(ty) {
+					pending = append(pending, t)
+					for _, p := range pending {
+						f.recv[p] = ty
+					}
+				}
+				pending = pending[:0]
+				continue
+			}
+			isElem := false
+			if nt == "[" {
+				// "a []T": the element type follows the bracket.
+				if e := matchBracket(toks, j); e > 0 {
+					j = nonWS(toks, e+1)
+					nt = atTok(toks, j)
+					isElem = true
+				}
+			}
 			if nt == "*" {
 				j = nonWS(toks, j+1)
 				nt = atTok(toks, j)
 			}
+			if nt == "map" || nt == "chan" {
+				// Container param: element type is the last ident
+				// before the next comma or close paren.
+				pending = append(pending, t)
+				if el := lastTypeIdent(toks, j); el != "" {
+					for _, p := range pending {
+						f.elem[p] = el
+					}
+				}
+				pending = pending[:0]
+				continue
+			}
 			if identTok(nt) && !tokenize.IsKeywordish(nt) {
 				pending = append(pending, t)
 				for _, p := range pending {
-					f.recv[p] = nt
+					if isElem {
+						f.elem[p] = nt
+					} else {
+						f.recv[p] = nt
+					}
 				}
 				pending = pending[:0]
 			} else {
@@ -488,11 +767,19 @@ func scanStructFields(toks []string, open int, typ string, f *facts) int {
 // chain is the dotted path before the trailing dot: "s.st." gives
 // ["s","st"], "st." gives ["st"]. Resolution order per step: doc
 // facts, then session facts, then corpus tables.
-func membersFor(chain []string, doc, sess *facts, tyMem, callM map[string][]string) (mems []string, corpusOnly bool) {
+func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map[string][]string) (mems []string, corpusOnly bool) {
 	if len(chain) == 0 {
 		return nil, false
 	}
-	typ := lookupRecv(chain[0], doc, sess)
+	typ := ""
+	if indexed {
+		// "m[k].": the head is a container; resolve the element
+		// type rather than the container variable.
+		typ = lookupElem(chain[0], doc, sess)
+	}
+	if typ == "" {
+		typ = lookupRecv(chain[0], doc, sess)
+	}
 	if typ == "" && len(chain) == 1 {
 		// Bare "x.": x may be a field of some type the file or
 		// session declares ("st" inside a Server method).
@@ -610,6 +897,18 @@ func lookupRecv(name string, doc, sess *facts) string {
 	return ""
 }
 
+func lookupElem(name string, doc, sess *facts) string {
+	if doc != nil {
+		if t := doc.elem[name]; t != "" {
+			return t
+		}
+	}
+	if sess != nil {
+		return sess.elem[name]
+	}
+	return ""
+}
+
 // fieldOwnerType finds the type of a field named ident on any type
 // declared in doc or session facts. Used for bare "st." when the
 // receiver chain has no explicit head type.
@@ -628,12 +927,14 @@ func fieldOwnerType(ident string, doc, sess *facts) string {
 }
 
 // dotChain parses the receiver expression ending at the trailing dot
-// of linePrefix. Returns the ident chain for "a.b." or, for a call
-// receiver "f(...).", the callee name with called=true.
-func dotChain(linePrefix string) (chain []string, call string, ok bool) {
+// of linePrefix. Returns the ident chain for "a.b.", or for a call
+// receiver "f(...)." the callee name. indexed reports that the last
+// segment was an index expression ("m[k].", "jobs[0]."), which makes
+// the head resolve to a container's element type.
+func dotChain(linePrefix string) (chain []string, call string, indexed, ok bool) {
 	tail := strings.TrimRight(linePrefix, " \t")
 	if !strings.HasSuffix(tail, ".") {
-		return nil, "", false
+		return nil, "", false, false
 	}
 	toks := tokenize.LexLine([]byte(tail))
 	// Walk the token list backwards from the trailing dot.
@@ -642,42 +943,41 @@ func dotChain(linePrefix string) (chain []string, call string, ok bool) {
 		i--
 	}
 	if i < 0 || toks[i] != "." {
-		return nil, "", false
+		return nil, "", false, false
 	}
 	i--
 	for i >= 0 && strings.TrimSpace(toks[i]) == "" {
 		i--
 	}
 	if i < 0 {
-		return nil, "", false
+		return nil, "", false, false
 	}
 	if toks[i] == ")" {
 		// Call receiver: find the matching "(" and the ident before it.
 		depth := 0
 		open := -1
 		for j := i; j >= 0; j-- {
-			switch toks[j] {
-			case ")":
+			if toks[j] == ")" {
 				depth++
-			case "(":
+			} else if toks[j] == "(" {
 				depth--
 				if depth == 0 {
 					open = j
-					j = -1
+					break
 				}
 			}
 		}
 		if open <= 0 {
-			return nil, "", false
+			return nil, "", false, false
 		}
 		j := open - 1
 		for j >= 0 && strings.TrimSpace(toks[j]) == "" {
 			j--
 		}
 		if j < 0 || !identTok(toks[j]) {
-			return nil, "", false
+			return nil, "", false, false
 		}
-		return nil, toks[j], true
+		return nil, toks[j], false, true
 	}
 	// Ident chain: a.b.c. Index expressions ("jobs[0].") collapse to
 	// their container link: field types already store the element
@@ -690,6 +990,9 @@ func dotChain(linePrefix string) (chain []string, call string, ok bool) {
 			continue
 		}
 		if t == "]" {
+			if len(rev) == 0 {
+				indexed = true
+			}
 			depth := 0
 			for ; i >= 0; i-- {
 				if toks[i] == "]" {
@@ -718,12 +1021,12 @@ func dotChain(linePrefix string) (chain []string, call string, ok bool) {
 		break
 	}
 	if len(rev) == 0 {
-		return nil, "", false
+		return nil, "", false, false
 	}
 	for l, r := 0, len(rev)-1; l < r; l, r = l+1, r-1 {
 		rev[l], rev[r] = rev[r], rev[l]
 	}
-	return rev, "", true
+	return rev, "", indexed, true
 }
 
 // factBuilder aggregates member facts across the whole corpus at

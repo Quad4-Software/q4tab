@@ -1555,14 +1555,14 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 				}
 			}
 			pf := extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
-			chain, call, isDot := dotChain(linePrefix)
+			chain, call, indexed, isDot := dotChain(linePrefix)
 			var mems []string
 			corpOnly := false
 			if isDot {
 				if call != "" {
 					mems = callMembers(call, pf, e.sessFacts, e.tyMem, e.callMem)
 				} else {
-					mems, corpOnly = membersFor(chain, pf, e.sessFacts, e.tyMem, e.callMem)
+					mems, corpOnly = membersFor(chain, indexed, pf, e.sessFacts, e.tyMem, e.callMem)
 				}
 				for _, m := range mems {
 					if ok := e.accept(m, ns, restN); ok && !seen[m] {

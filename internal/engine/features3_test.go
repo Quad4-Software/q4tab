@@ -175,6 +175,8 @@ func TestPlausibleFilters(t *testing.T) {
 		{"decl in call arg", " i := 0", "f(", false},
 		{"decl at stmt start ok", " i := 0", "x = f()\n\t", true},
 		{"dot junk in operand", ".N; i := 0", "ch <-", false},
+		{"comment prose midline", "i++ {\n\t}// The completed {", "for x", false},
+		{"comment lowercase ok", "i++ // bump it", "for x", true},
 	}
 	for _, c := range cases {
 		if got := plausible(c.cand, c.line); got != c.want {
@@ -202,9 +204,12 @@ func TestExtractFactsBasics(t *testing.T) {
 func TestMemberIndexChain(t *testing.T) {
 	// "w.q.jobs[0]." collapses the index to its container link:
 	// Worker -> Queue -> []Job -> Job fields.
-	chain, call, ok := dotChain("\tw.q.jobs[0].")
+	chain, call, indexed, ok := dotChain("\tw.q.jobs[0].")
 	if !ok || call != "" {
 		t.Fatalf("dotChain: %v %q %v", chain, call, ok)
+	}
+	if !indexed {
+		t.Fatal("jobs[0] should mark the tail segment indexed")
 	}
 	if len(chain) != 3 || chain[0] != "w" || chain[2] != "jobs" {
 		t.Fatalf("chain wrong: %v", chain)
@@ -227,7 +232,7 @@ type Worker struct {
 func (w *Worker) tick() {
 }
 `)))
-	mems, _ := membersFor(chain, f, nil, nil, nil)
+	mems, _ := membersFor(chain, true, f, nil, nil, nil)
 	var got []string
 	for _, m := range mems {
 		got = append(got, m)
@@ -302,5 +307,117 @@ func Dial() (*Sess, error) { return nil, nil }
 	}
 	if !strings.Contains(flat, "Close(") {
 		t.Fatalf("Dial should offer Sess members via retT: %v", flat)
+	}
+}
+
+func TestMapVarIndexCompletion(t *testing.T) {
+	// "var m map[string]*Session" then "m[k]." resolves to the value
+	// type's fields, while bare "m." stays unresolved (maps have no
+	// members worth completing).
+	f := extractFactsToks(tokenize.Lex([]byte(`package q
+
+type Session struct {
+	Token string
+}
+
+func x() {
+	var m map[string]*Session
+	m["k"].`)))
+	if f.elem["m"] != "Session" {
+		t.Fatalf("elem wrong: %v", f.elem)
+	}
+	if f.recv["m"] != "" {
+		t.Fatalf("map var should not record recv type: %v", f.recv)
+	}
+	chain, _, indexed, ok := dotChain("\tm[\"k\"].")
+	if !ok || !indexed || len(chain) != 1 {
+		t.Fatalf("dotChain: %v %v %v", chain, indexed, ok)
+	}
+	mems, _ := membersFor(chain, indexed, f, nil, nil, nil)
+	if len(mems) == 0 || mems[0] != "Token" {
+		t.Fatalf("map index members wrong: %v", mems)
+	}
+}
+
+func TestRangeVarElem(t *testing.T) {
+	f := extractFactsToks(tokenize.Lex([]byte(`package q
+
+type Job struct{ ID string }
+
+type Store struct {
+	jobs []Job
+}
+
+func (s *Store) all() {
+	for _, j := range s.jobs {
+		_ = j
+	}
+}
+`)))
+	if f.recv["j"] != "Job" {
+		t.Fatalf("range var type wrong: %v", f.recv)
+	}
+}
+
+func TestSliceParamElem(t *testing.T) {
+	// "func f(ss []Session)" binds ss's element type, not a type.
+	f := extractFactsToks(tokenize.Lex([]byte(`package q
+
+type Session struct{ Token string }
+
+func f(ss []Session) {
+}
+`)))
+	if f.elem["ss"] != "Session" {
+		t.Fatalf("slice param elem wrong: %v", f.elem)
+	}
+	if f.recv["ss"] != "" {
+		t.Fatalf("slice param should not record recv: %v", f.recv)
+	}
+}
+
+func TestPythonAndTSFacts(t *testing.T) {
+	f := extractFactsToks(tokenize.Lex([]byte(`class Queue:
+    def push(self, job):
+        pass
+    def pop(self):
+        pass
+
+def make_queue() -> Queue:
+    return Queue()
+
+q = Queue()
+`)))
+	if !f.tyMem["Queue"]["push("] || !f.tyMem["Queue"]["pop("] {
+		t.Fatalf("class methods missing: %v", f.tyMem)
+	}
+	if f.retT["make_queue"] != "Queue" {
+		t.Fatalf("py retT wrong: %v", f.retT)
+	}
+	if f.recv["q"] != "Queue" {
+		t.Fatalf("ctor call recv wrong: %v", f.recv)
+	}
+
+	ts := extractFactsToks(tokenize.Lex([]byte(`interface User {
+	id: string;
+	name: string;
+	save(): void;
+}
+
+const u: User = getUser();
+u.`)))
+	if !ts.tyMem["User"]["id"] || !ts.tyMem["User"]["save("] {
+		t.Fatalf("interface members missing: %v", ts.tyMem)
+	}
+	if ts.recv["u"] != "User" {
+		t.Fatalf("annotation recv wrong: %v", ts.recv)
+	}
+	chain, _, _, ok := dotChain("u.")
+	if !ok {
+		t.Fatal("dotChain failed")
+	}
+	mems, _ := membersFor(chain, false, ts, nil, nil, nil)
+	if len(mems) == 0 {
+		t.Fatal("no members for annotated u")
 	}
 }

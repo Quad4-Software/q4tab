@@ -67,8 +67,14 @@ layer fixes that with lightweight fact extraction, not a typechecker:
 - `func (r *T) M(` records `M` as a member of `T` and `r` as holding
   type `T`
 - `type T struct { f U }` records field `f` and its type, so
-  `x.field.` chains resolve
-- `x := NewT(`, `var x T`, and typed parameters record `x` as `T`
+  `x.field.` chains resolve; `class`/`interface`/`type T interface`
+  bodies get the same treatment in other languages
+- `x := NewT(`, `var x T`, `x = T(`, `x: T` annotations, and typed
+  parameters record `x` as `T`
+- `x []T`, `x map[K]V`, `x := make([]T)` record element types, so
+  `x[0].` and `x[k].` resolve to `T` members
+- `for v := range c` and `for v in c` bind `v` to `c`'s element type
+- `func F() *T` records result types, so `F().` offers `T` members
 - `F(...)` followed by `.M` records `M` as a member seen on `F`'s
   result, so `json.NewDecoder(r).` offers `Decode(`
 

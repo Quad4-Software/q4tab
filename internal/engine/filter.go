@@ -86,6 +86,27 @@ func plausible(cand, linePrefix string) bool {
 		return false
 	}
 
+	// Trailing comment prose inside a multi-line candidate:
+	// "} // The completed {" glued two corpus artifacts together.
+	// Only mid-line comments count; a comment-first line is legit.
+	for _, marker := range []string{"//", "#"} {
+		k := strings.Index(cand, marker+" ")
+		if k <= 0 {
+			continue
+		}
+		rest := strings.TrimLeft(cand[k+len(marker):], " \t")
+		if rest == "" || rest[0] < 'A' || rest[0] > 'Z' {
+			continue
+		}
+		w := 0
+		for w < len(rest) && isIdentByte(rest[w]) {
+			w++
+		}
+		if w+1 < len(rest) && rest[w] == ' ' && rest[w+1] >= 'a' && rest[w+1] <= 'z' {
+			return false
+		}
+	}
+
 	// Prose leak: a capitalized word followed by a lowercase word is
 	// a sentence fragment, not code. Ident-start capital then space
 	// then lowercase covers "The completed", "No such" etc.
