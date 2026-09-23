@@ -69,9 +69,13 @@ func rssBytes() int64 {
 
 // BuildIndexBudget is BuildIndex with explicit memory guardrails:
 // tightenToks gates low-order counting once the corpus passes it, and
-// memMB caps the process RSS — at 55% of the cap the build tightens
+// memMB caps the process RSS: at 55% of the cap the build tightens
 // early, at 80% it freezes gated orders outright. 0 disables each.
 func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, memMB int, progress io.Writer) (*Bundle, BuildStats, error) {
+	// A tighter GC target keeps the large count maps from drifting far
+	// above live heap between collections.
+	old := debug.SetGCPercent(50)
+	defer debug.SetGCPercent(old)
 	v := model.NewVocab()
 	mb := model.NewBuilder(v, order, minCnt)
 	lb := lines.NewBuilder()
@@ -79,7 +83,7 @@ func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, m
 	sb := newStructBuilder()
 	langs := newLangBuilder()
 	sv := model.NewVocab()
-	subB := model.NewBuilderPlain(sv, 3, []uint32{0, 1, 1, 2})
+	subB := model.NewBuilderPlain(sv, 3, subMinCnt)
 	syms := symbols.NewIndex()
 	var st BuildStats
 	var tightened, frozen bool
@@ -89,8 +93,12 @@ func BuildIndexBudget(roots []string, order int, minCnt []uint32, tightenToks, m
 	go corpus.Collect(roots, ch)
 	for f := range ch {
 		st.Files++
+		st.Meta = append(st.Meta, FileMeta{Path: f.Path, Size: int64(f.Size), ModTime: f.ModTime})
+		if f.DupOf != "" {
+			// Identical content already indexed under DupOf.
+			continue
+		}
 		st.Bytes += len(f.Data)
-		st.Meta = append(st.Meta, FileMeta{Path: f.Path, Size: int64(len(f.Data)), ModTime: f.ModTime})
 		lb.AddFile(f.Data)
 		gb.AddFile(f.Data)
 		for _, s := range symbols.Extract(f.Path, f.Data) {

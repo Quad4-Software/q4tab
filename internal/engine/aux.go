@@ -360,6 +360,10 @@ func (sb *structBuilder) Compact() *model.Order {
 	return rowsToOrder(sb.rows, 2, 24)
 }
 
+// subMinCnt is the pruning floor for the order-3 subtoken model,
+// shared by the in-memory and spill build paths.
+var subMinCnt = []uint32{0, 1, 1, 2}
+
 // subtokIDs maps a token stream to the subtoken stream for the
 // identifier model: identifiers split into parts, continuation parts
 // carry a \x01 marker so the model can tell starts from middles, and

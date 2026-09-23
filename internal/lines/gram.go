@@ -230,3 +230,6 @@ func (b *GramBuilder) Compact(li *Index) *GramIndex {
 type gcent struct {
 	tok, cnt int32
 }
+
+// Len returns the number of distinct gram contexts. Used by diagnostics.
+func (b *GramBuilder) Len() int { return len(b.grams) }

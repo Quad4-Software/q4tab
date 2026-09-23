@@ -225,3 +225,6 @@ func (idx *Index) HasPrefix(p string) bool {
 
 // Len returns the number of unique lines.
 func (idx *Index) Len() int { return len(idx.Cnts) }
+
+// Len returns the number of distinct lines seen. Used by diagnostics.
+func (b *Builder) Len() int { return len(b.counts) }

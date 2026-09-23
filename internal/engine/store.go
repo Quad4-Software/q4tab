@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,7 +58,9 @@ import (
 const (
 	storeMagicV2 = 0x51344332 // 'Q4C2' with u32 version 1 or 2
 	storeMagic   = 0x51344333 // 'Q4C3'
-	storeVersion = 3
+	// v4 adds keybits in flags bits 1-7 (the context-hash key width
+	// used by spill builds). v3 files carry no keybits and still load.
+	storeVersion = 4
 )
 
 // Save writes the bundle to path atomically in the packed binary format.
@@ -85,6 +88,12 @@ func Save(path string, b *Bundle) error {
 	var flags byte
 	if m.KN {
 		flags |= 1
+	}
+	if m.KeyMask != 0 {
+		kb := bits.Len64(m.KeyMask)
+		if kb >= 1 && kb < 64 {
+			flags |= byte(kb) << 1
+		}
 	}
 	w.Write([]byte{flags})
 	pad8(w)
@@ -304,13 +313,19 @@ func Load(path string) (*Bundle, error) {
 	vn := int(r.u32())
 	flags := r.bytes(1)
 	r.align8()
-	if ver != storeVersion {
+	if ver != 3 && ver != storeVersion {
 		return nil, fmt.Errorf("model: unsupported version %d", ver)
 	}
 	if n < 1 || n > 16 || vn < 0 || vn > 1<<27 {
 		return nil, fmt.Errorf("model: bad header order=%d vocab=%d", n, vn)
 	}
 	kn := len(flags) > 0 && flags[0]&1 != 0
+	var keyMask uint64
+	if ver >= 4 && len(flags) > 0 {
+		if kb := int(flags[0] >> 1); kb > 0 {
+			keyMask = uint64(1)<<kb - 1
+		}
+	}
 	voffs := r.u32s(vn + 1)
 	vlen := r.u64()
 	vblob := r.bytes(int(vlen))
@@ -322,7 +337,7 @@ func Load(path string) (*Bundle, error) {
 		return nil, fmt.Errorf("model: corrupt vocab offsets")
 	}
 	v := model.VocabFromBlob(vblob, voffs)
-	m := &model.Model{Vocab: v, N: n, KN: kn}
+	m := &model.Model{Vocab: v, N: n, KN: kn, KeyMask: keyMask}
 	m.Orders = make([]model.Order, n+1)
 
 	if kn {

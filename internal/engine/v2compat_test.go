@@ -10,7 +10,9 @@ import (
 func TestV2ModelCompat(t *testing.T) {
 	p := os.Getenv("Q4_V2_MODEL")
 	if p == "" {
-		p = "/home/user1/.local/share/q4complete/model.bin"
+		// The deployed model.bin is the v3 build; the v2 backup kept
+		// alongside it is the compat target.
+		p = "/home/user1/.local/share/q4complete/model-v2-backup.bin"
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Skip("no deployed v2 model at", p)
