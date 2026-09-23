@@ -35,11 +35,11 @@ func TestIncrementalIndex(t *testing.T) {
 	modelPath := filepath.Join(t.TempDir(), "model.bin")
 
 	// Full build writes a manifest.
-	m, li, st, err := engine.BuildIndex([]string{root}, 6, nil, nil)
+	bun, st, err := engine.BuildIndex([]string{root}, 6, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.Save(modelPath, m, li); err != nil {
+	if err := engine.Save(modelPath, bun); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeManifest(modelPath+".manifest", []string{root}, st.Meta); err != nil {

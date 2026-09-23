@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,12 +101,12 @@ func loadEngine(cfg config) *engine.Engine {
 		ecfg.MaxLines = cfg.MaxLines
 	}
 	e := engine.New(ecfg)
-	m, li, err := engine.Load(defaultModelPath())
+	bun, err := engine.Load(defaultModelPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "q4complete: no model at %s (%v); running with file-local completion only\n", defaultModelPath(), err)
 		return e
 	}
-	e.SetModel(m, li)
+	e.SetBundle(bun)
 	if delta, err := engine.LoadDelta(defaultModelPath() + ".delta"); err == nil {
 		e.InstallDelta(delta)
 	}
@@ -134,22 +135,54 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 	}
 	e := loadEngine(cfg)
 	best := engine.DefaultWeights()
-	// Phase 1: journal-trained logistic reranker. The accept/reject
-	// history yields a per-source multiplier used as the starting point
-	// for the holdout search below. With no journal, defaults stand.
+	// Phase 1: journal-trained reranker. The accept/reject history
+	// yields a per-source multiplier plus a rank calibrator applied at
+	// merge time. With no journal, defaults stand.
 	if evs, err := engine.LoadJournalEvents(defaultJournalPath(), 100000); err == nil {
 		if mult := engine.TrainSourceWeights(evs, 256); mult != nil {
 			best.ApplySourceWeights(mult)
 			log("journal: %d events -> source multipliers %v", len(evs), mult)
+		}
+		if cal := engine.TrainCalibrator(evs, 256); cal != nil {
+			best.Cal = cal
+			log("journal: calibrator trained (bias=%.2f srcs=%d)", cal.Bias, len(cal.SrcW))
 		} else {
 			log("journal: %d events, too few to train (need 256)", len(evs))
 		}
 	}
-	// Phase 2: coordinate descent over the holdout. The holdout decides.
-	// the journal only supplies a starting point.
+	// Phase 2: deleted interpolation, cross-validated on this holdout.
+	// Scales are trained on the holdout token stream, then kept only if
+	// they beat plain KN on the same set: backoff rescaling is a
+	// second-order effect that can lose on a different distribution.
+	def := engine.DefaultWeights()
+	e.SetWeights(def)
 	rep, _ := evalOnce(e, files, perFile, seed, false)
+	defScore := rep.Hit1
+	var texts []string
+	for _, f := range files {
+		texts = append(texts, string(f.Data))
+	}
+	if lamK := e.TrainLamK(texts); lamK != nil {
+		w2 := def
+		w2.LamK = lamK
+		e.SetWeights(w2)
+		rep2, _ := evalOnce(e, files, perFile, seed, false)
+		if rep2.Hit1 > defScore {
+			best.LamK = lamK
+			log("lamK kept: %.1f%% -> %.1f%% (%v)", defScore, rep2.Hit1, lamK[1:])
+		} else {
+			e.SetWeights(def)
+			log("lamK rejected: %.1f%% -> %.1f%%", defScore, rep2.Hit1)
+		}
+	}
+	// Phase 3: coordinate descent over the holdout. The holdout
+	// decides; the journal and interpolation only supply starting
+	// points. Baseline is measured with the DEFAULT weights so a tune
+	// run that finds nothing cannot regress the shipped config.
+	e.SetWeights(best)
+	rep, _ = evalOnce(e, files, perFile, seed, false)
 	bestScore := rep.Hit1
-	log("baseline hit@1=%.1f%% (files=%d tries=%d)", bestScore, rep.Files, rep.Tries)
+	log("baseline hit@1=%.1f%% tuned-start=%.1f%% (files=%d tries=%d)", defScore, bestScore, rep.Files, rep.Tries)
 
 	knobs := []struct {
 		name string
@@ -175,6 +208,18 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 		{"model", []float64{0.5, 1, 2, 4},
 			func(w *engine.Weights) float64 { return w.Model },
 			func(w *engine.Weights, v float64) { w.Model = v }},
+		{"lineBi", []float64{1e5, 4e5, 1e6},
+			func(w *engine.Weights) float64 { return w.LineBi },
+			func(w *engine.Weights, v float64) { w.LineBi = v }},
+		{"struct", []float64{0.5, 2, 5},
+			func(w *engine.Weights) float64 { return w.Struct },
+			func(w *engine.Weights, v float64) { w.Struct = v }},
+		{"lang", []float64{0.5, 3, 8},
+			func(w *engine.Weights) float64 { return w.Lang },
+			func(w *engine.Weights, v float64) { w.Lang = v }},
+		{"sub", []float64{1e5, 3e5, 1e6},
+			func(w *engine.Weights) float64 { return w.Sub },
+			func(w *engine.Weights, v float64) { w.Sub = v }},
 	}
 	for _, k := range knobs {
 		cur := k.get(&best)
@@ -195,6 +240,10 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 		}
 	}
 	e.SetWeights(best)
+	if bestScore <= defScore {
+		log("tune: no improvement over defaults (%.1f%% <= %.1f%%); keeping existing weights", bestScore, defScore)
+		return
+	}
 	out := defaultModelPath() + ".weights"
 	data, _ := json.MarshalIndent(best, "", "  ")
 	if err := os.WriteFile(out, data, 0o644); err != nil {
@@ -315,6 +364,8 @@ func main() {
 		fs := flag.NewFlagSet("index", flag.ExitOnError)
 		out := fs.String("o", defaultModelPath(), "output model path")
 		order := fs.Int("order", 0, "n-gram order (default from config or 6)")
+		budget := fs.Int("budget", 48, "memory guard: gate low-order counting after this many million tokens (0 = off)")
+		memMB := fs.Int("mem", 0, "memory guard: RSS ceiling in MB (0 = 70% of physical memory, -1 = off)")
 		incr := fs.Bool("incr", false, "incremental: fold changed files into the delta overlay")
 		var roots multiFlag
 		fs.Var(&roots, "root", "corpus root directory (repeatable)")
@@ -339,8 +390,13 @@ func main() {
 			}
 			log("index: falling back to a full build")
 		}
+		if *memMB == 0 {
+			*memMB = defaultMemCapMB()
+		} else if *memMB < 0 {
+			*memMB = 0
+		}
 		log("indexing %d roots at order %d", len(roots), *order)
-		m, li, st, err := engine.BuildIndex(roots, *order, nil, os.Stderr)
+		bun, st, err := engine.BuildIndexBudget(roots, *order, nil, *budget*1_000_000, *memMB, os.Stderr)
 		if err != nil {
 			log("index: %v", err)
 			os.Exit(1)
@@ -349,7 +405,7 @@ func main() {
 			log("index: %v", err)
 			os.Exit(1)
 		}
-		if err := engine.Save(*out, m, li); err != nil {
+		if err := engine.Save(*out, bun); err != nil {
 			log("index: %v", err)
 			os.Exit(1)
 		}
@@ -455,22 +511,35 @@ func main() {
 	case "stats":
 		fs := flag.NewFlagSet("stats", flag.ExitOnError)
 		fs.Parse(os.Args[2:])
-		m, li, err := engine.Load(defaultModelPath())
+		bun, err := engine.Load(defaultModelPath())
 		if err != nil {
 			log("stats: %v", err)
 			os.Exit(1)
 		}
+		m := bun.M
 		var rows, entries int64
 		for k := 1; k <= m.N; k++ {
 			rows += int64(len(m.Orders[k].Keys))
 			entries += m.Orders[k].NToks
 		}
 		nl := 0
-		if li != nil {
-			nl = li.Len()
+		if bun.Lines != nil {
+			nl = bun.Lines.Len()
 		}
-		fmt.Printf("vocab=%d order=%d contexts=%d entries=%d lines=%d\n",
-			m.Vocab.Len(), m.N, rows, entries, nl)
+		var gramKeys, structKeys, nIdent int
+		if bun.LineBi != nil {
+			gramKeys = len(bun.LineBi.Keys)
+		}
+		if bun.Struct != nil {
+			structKeys = len(bun.Struct.Keys)
+		}
+		if bun.Idents != nil {
+			nIdent = len(bun.Idents.Ids)
+		}
+		fmt.Printf("vocab=%d order=%d kn=%v contexts=%d entries=%d lines=%d\n",
+			m.Vocab.Len(), m.N, m.KN, rows, entries, nl)
+		fmt.Printf("lineGrams=%d structCtx=%d langs=%d idents=%d subvocab=%d\n",
+			gramKeys, structKeys, len(bun.Langs), nIdent, subVocabLen(bun))
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
@@ -727,81 +796,34 @@ func runEval(e *engine.Engine, roots []string, nFiles, perFile int, seed int64, 
 }
 
 // langOf classifies a file path into a language bucket for eval
-// reporting. Extensions are matched lowercase. Well-known extensionless
-// names are handled too.
-func langOf(path string) string {
-	base := filepath.Base(path)
-	switch strings.ToLower(base) {
-	case "dockerfile", "containerfile":
-		return "dockerfile"
-	case "makefile", "gnumakefile":
-		return "makefile"
+// reporting. The shared implementation lives in engine.LangOf.
+// defaultMemCapMB returns 70% of physical memory in MB, or 0 when the
+// total cannot be read.
+func defaultMemCapMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
 	}
-	switch strings.ToLower(filepath.Ext(base)) {
-	case ".go":
-		return "go"
-	case ".py", ".pyi":
-		return "python"
-	case ".ts", ".tsx", ".mts", ".cts":
-		return "typescript"
-	case ".js", ".jsx", ".mjs", ".cjs":
-		return "javascript"
-	case ".rs":
-		return "rust"
-	case ".c", ".h":
-		return "c"
-	case ".cpp", ".cc", ".cxx", ".hpp", ".hh":
-		return "cpp"
-	case ".java":
-		return "java"
-	case ".kt", ".kts":
-		return "kotlin"
-	case ".rb":
-		return "ruby"
-	case ".php":
-		return "php"
-	case ".cs":
-		return "csharp"
-	case ".swift":
-		return "swift"
-	case ".scala":
-		return "scala"
-	case ".hs":
-		return "haskell"
-	case ".lua":
-		return "lua"
-	case ".zig":
-		return "zig"
-	case ".ex", ".exs":
-		return "elixir"
-	case ".sh", ".bash", ".zsh":
-		return "shell"
-	case ".md", ".markdown":
-		return "markdown"
-	case ".json", ".jsonc":
-		return "json"
-	case ".yaml", ".yml":
-		return "yaml"
-	case ".toml":
-		return "toml"
-	case ".xml":
-		return "xml"
-	case ".html", ".htm":
-		return "html"
-	case ".css", ".scss", ".less":
-		return "css"
-	case ".sql":
-		return "sql"
-	case ".proto":
-		return "proto"
-	case ".vim":
-		return "vim"
-	case ".nix":
-		return "nix"
-	case ".txt", ".text":
-		return "text"
+	for _, ln := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(ln, "MemTotal:") {
+			f := strings.Fields(ln)
+			if len(f) >= 2 {
+				if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil {
+					return int(kb * 7 / 10 / 1024)
+				}
+			}
+		}
 	}
-	return "other"
+	return 0
+}
+
+func langOf(path string) string { return engine.LangOf(path) }
+
+func subVocabLen(b *engine.Bundle) int {
+	if b.Sub == nil || b.Sub.Vocab == nil {
+		return 0
+	}
+	return b.Sub.Vocab.Len()
 }
 
 // manifest records what the index knows about each corpus file so an
