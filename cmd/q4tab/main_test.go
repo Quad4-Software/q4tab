@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"q4complete/internal/engine"
+	"q4tab/internal/engine"
 )
 
 func TestLangOf(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"q4complete/internal/lines"
+	"q4tab/internal/lines"
 )
 
 // Tenant isolation: hosted learns land only in the caller's overlay,

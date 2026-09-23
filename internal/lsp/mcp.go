@@ -11,7 +11,7 @@ package lsp
 // (<= 2025-11-25) and stateless requests (2026-07-28), so any client
 // that can call tools/call works.
 //
-// The tool surface turns q4complete into a retrieval backend for coding
+// The tool surface turns q4tab into a retrieval backend for coding
 // agents: ground an LLM in the corpus's actual idioms instead of letting
 // it guess APIs.
 
@@ -25,14 +25,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"q4complete/internal/engine"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/engine"
+	"q4tab/internal/tokenize"
 )
 
 // MCP protocol versions this server speaks. Newest first.
 var mcpVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
 
-var mcpServerInfo = map[string]any{"name": "q4complete", "version": "0.1.0"}
+var mcpServerInfo = map[string]any{"name": "q4tab", "version": "0.1.0"}
 
 // MCPServer exposes engine features as MCP tools.
 type MCPServer struct {
@@ -46,7 +46,7 @@ func NewMCPServer(eng *engine.Engine) *MCPServer {
 }
 
 // ServeMCP runs the stdio transport: newline-delimited JSON-RPC on
-// r/w. Run it as `q4complete mcp` and point any MCP client at the binary.
+// r/w. Run it as `q4tab mcp` and point any MCP client at the binary.
 // Stdio is a local trust boundary, so file-path reads are allowed.
 func (m *MCPServer) ServeMCP(r io.Reader, w io.Writer) error {
 	m.allowFS = true

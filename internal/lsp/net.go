@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"q4complete/internal/engine"
+	"q4tab/internal/engine"
 )
 
 // ServerOpts controls the network transports' security posture.
@@ -133,7 +133,7 @@ func HTTPHandler(eng *engine.Engine, deltaPath string, opts ServerOpts) http.Han
 	}, false))
 	// Optional pprof endpoints for profiling live servers. Gated on an
 	// env var so public deployments never expose them by accident.
-	if os.Getenv("Q4_PPROF") != "" {
+	if os.Getenv("Q4TAB_PPROF") != "" {
 		runtime.SetMutexProfileFraction(5)
 		runtime.SetBlockProfileRate(1000)
 		mux.HandleFunc("/debug/pprof/", pprof.Index)

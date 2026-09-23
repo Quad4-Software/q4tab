@@ -1,4 +1,4 @@
-# q4complete
+# q4tab
 
 Fully local code completion trained on your codebase. Statistical model,
 no cloud, no GPU, no network calls, no LLM. Single-digit-millisecond
@@ -12,8 +12,8 @@ internal APIs, not generic ones.
 ## Install
 
 ```sh
-go build -o bin/q4complete ./cmd/q4complete
-cp bin/q4complete ~/.local/bin/
+go build -o bin/q4tab ./cmd/q4tab
+cp bin/q4tab ~/.local/bin/
 ```
 
 ## Train
@@ -21,11 +21,11 @@ cp bin/q4complete ~/.local/bin/
 Point it at directories, or mirror the whole org first:
 
 ```sh
-q4complete collect --org Quad4-Software --dest ~/corpus   # optional
-q4complete index --root ~/projects --root ~/corpus
+q4tab collect --org Quad4-Software --dest ~/corpus   # optional
+q4tab index --root ~/projects --root ~/corpus
 ```
 
-The model lands in `~/.local/share/q4complete/model.bin` plus a
+The model lands in `~/.local/share/q4tab/model.bin` plus a
 `model.bin.manifest` used for incremental updates. Re-run `index`
 nightly or after big changes. For scale reference: 247k files / 272M
 tokens of mixed source (after content dedup) indexes in about 7 minutes
@@ -52,7 +52,7 @@ memory) the aux indexes freeze. `-budget 0 -mem -1` disables both.
 ### Incremental index
 
 ```sh
-q4complete index -incr --root ~/projects --root ~/corpus
+q4tab index -incr --root ~/projects --root ~/corpus
 ```
 
 Diffs the tree against the manifest: unchanged files are skipped,
@@ -65,7 +65,7 @@ base model until that rebuild.
 ## QA
 
 ```sh
-q4complete eval -root ~/projects/somerepo -files 50 -pos 10
+q4tab eval -root ~/projects/somerepo -files 50 -pos 10
 ```
 
 `eval` samples random mid-line cursor positions in real files, masks the
@@ -83,9 +83,9 @@ general model, so `feat:` vs `add:` comes out however the project
 actually writes it:
 
 ```sh
-q4complete commitmsg -train -repo . -o ~/.local/share/q4complete/commits/myrepo
-q4complete index -root ~/.local/share/q4complete/commits/myrepo -o /tmp/commit-model.q4m
-git add -p && q4complete commitmsg -model /tmp/commit-model.q4m
+q4tab commitmsg -train -repo . -o ~/.local/share/q4tab/commits/myrepo
+q4tab index -root ~/.local/share/q4tab/commits/myrepo -o /tmp/commit-model.q4m
+git add -p && q4tab commitmsg -model /tmp/commit-model.q4m
 ```
 
 `-train` rewrites `git log -p` into diff-to-message documents. Suggest
@@ -95,7 +95,7 @@ model completions first, then a `type(scope): update <path>` fallback.
 It names the right identifiers and repo conventions, but it retrieves
 rather than summarizes. Treat the output as a starting point.
 
-Config is `~/.config/q4complete/config.json`:
+Config is `~/.config/q4tab/config.json`:
 
 ```json
 {
@@ -111,11 +111,11 @@ Config is `~/.config/q4complete/config.json`:
 cd vscode
 npm install
 npm run package
-code --install-extension q4complete-0.1.0.vsix
+code --install-extension q4tab-0.1.0.vsix
 ```
 
-The extension spawns `q4complete serve` (resolved in order: the
-configured `q4complete.serverPath`, the binary bundled in the vsix,
+The extension spawns `q4tab serve` (resolved in order: the
+configured `q4tab.serverPath`, the binary bundled in the vsix,
 then PATH) and provides two completion surfaces: ghost-text inline
 suggestions that appear as you type, and the classic dropdown via
 Ctrl+Space. Tab accepts either one. Esc dismisses. Ctrl+Right accepts
@@ -124,15 +124,15 @@ one word at a time.
 Status bar shows model size when running, an error icon when the
 server fails (click for the log). Commands on the palette:
 
-- `q4complete: Trigger Suggestion` (Alt+\\) - force a suggestion
-- `q4complete: Index Workspace` - folds open folders into the
+- `q4tab: Trigger Suggestion` (Alt+\\) - force a suggestion
+- `q4tab: Index Workspace` - folds open folders into the
   incremental delta and hot-reloads it into the running server
-- `q4complete: Restart Server`, `q4complete: Toggle Completions`,
-  `q4complete: Show Status`, `q4complete: Show Log`
+- `q4tab: Restart Server`, `q4tab: Toggle Completions`,
+  `q4tab: Show Status`, `q4tab: Show Log`
 
-Settings: `q4complete.serverPath`, `q4complete.modelPath`,
-`q4complete.enabled`, `q4complete.maxSuggestions`,
-`q4complete.requestTimeout`.
+Settings: `q4tab.serverPath`, `q4tab.modelPath`,
+`q4tab.enabled`, `q4tab.maxSuggestions`,
+`q4tab.requestTimeout`.
 
 ## Neovim
 
@@ -142,21 +142,21 @@ Put `nvim/` on your runtimepath (plugin manager of choice, or symlink
 `nvim/` into `~/.config/nvim/pack/*/start/`). Then:
 
 ```lua
-require("q4complete").setup()
+require("q4tab").setup()
 ```
 
 Ghost text appears as you type. `Tab` accepts (falls through to a
 normal Tab when nothing is shown), `Alt-]` / `Alt-[` cycle candidates.
 Accepting a suggestion sends the attached learn command back to the
-server automatically. `:lua require("q4complete").toggle()` flips
+server automatically. `:lua require("q4tab").toggle()` flips
 suggestions on and off. `setup({ completion = true })` additionally
 enables the builtin popup completion against the same server.
 
 No plugin? This minimal config still works on 0.12+:
 
 ```lua
-vim.lsp.config('q4complete', { cmd = { 'q4complete', 'serve' } })
-vim.lsp.enable('q4complete')
+vim.lsp.config('q4tab', { cmd = { 'q4tab', 'serve' } })
+vim.lsp.enable('q4tab')
 vim.lsp.inline_completion.enable()
 ```
 
@@ -169,10 +169,10 @@ the lowest-latency option, and HTTP covers everything else.
 
 ```sh
 # editor-facing: LSP over TCP (same framing as stdio)
-q4complete serve -listen 127.0.0.1:7917
+q4tab serve -listen 127.0.0.1:7917
 
 # operational/agent-facing: HTTP
-q4complete serve -http 127.0.0.1:7918
+q4tab serve -http 127.0.0.1:7918
 #   POST /rpc      JSON-RPC, same methods as the LSP transport
 #   POST /mcp      MCP endpoint (see below)
 #   GET  /status   engine stats as JSON
@@ -186,13 +186,13 @@ didChange state persists across requests.
 VS Code remote mode:
 
 ```json
-{ "q4complete.serverAddr": "10.0.0.5:7917" }
+{ "q4tab.serverAddr": "10.0.0.5:7917" }
 ```
 
 Neovim remote mode:
 
 ```lua
-require("q4complete").setup({ addr = "10.0.0.5:7917" })
+require("q4tab").setup({ addr = "10.0.0.5:7917" })
 ```
 
 Warning: the model contains verbatim source lines. Bind to loopback or
@@ -200,15 +200,15 @@ put the listener behind a VPN/TLS terminator before exposing it.
 
 ## MCP (LLM / agent integration)
 
-q4complete doubles as an MCP server so coding agents can ground
+q4tab doubles as an MCP server so coding agents can ground
 themselves in the corpus instead of guessing APIs.
 
 ```sh
-q4complete mcp   # stdio transport, one JSON-RPC message per line
+q4tab mcp   # stdio transport, one JSON-RPC message per line
 ```
 
 Point any MCP client at that command (Claude Code: `claude mcp add
-q4complete -- q4complete mcp`), or POST to `/mcp` on the HTTP listener
+q4tab -- q4tab mcp`), or POST to `/mcp` on the HTTP listener
 for remote agents. Speaks MCP `2025-06-18`, `2025-03-26`, and
 `2024-11-05`, plus `server/discover` for newer clients.
 
@@ -221,7 +221,7 @@ Tools:
 | `learn` | `text`, `uri`, `line` | feeds the accept-learning loop |
 | `status` | none | corpus size, counters, memory |
 
-The division of labor: q4complete is the fast deterministic path in the
+The division of labor: q4tab is the fast deterministic path in the
 editor, the LLM uses `lookup_lines`/`complete` to fetch real idioms for
 explanation, refactoring, and code review, and `learn` feeds accepted
 results back into the ranking.
@@ -230,13 +230,13 @@ results back into the ranking.
 
 The server speaks LSP 3.18 including `textDocument/inlineCompletion`
 (UTF-16 positions, per spec). Any client that implements that method
-works with `q4complete serve` over stdio.
+works with `q4tab serve` over stdio.
 
 ## Try it without an editor
 
 ```sh
-q4complete complete -f somefile.go -line 12 -col 20
-q4complete stats
+q4tab complete -f somefile.go -line 12 -col 20
+q4tab stats
 ```
 
 ## How it works
@@ -273,11 +273,11 @@ document's own indent unit (tabs vs spaces).
 
 Accepted completions are sent back via `q4/learn` (the extension wires
 this to the accept event automatically. The server also accepts
-`workspace/executeCommand` with `q4complete.learn`). Accepted text is
-appended to `~/.local/share/q4complete/learned.jsonl`, replayed on
+`workspace/executeCommand` with `q4tab.learn`). Accepted text is
+appended to `~/.local/share/q4tab/learned.jsonl`, replayed on
 startup, mixed into the learned n-gram cache, and indexed into the
 dynamic line index so the same context retrieves it next time. The
-journal self-compacts at 4MB. Set `Q4COMPLETE_JOURNAL` to relocate it.
+journal self-compacts at 4MB. Set `Q4TAB_JOURNAL` to relocate it.
 
 Shown-but-not-accepted suggestions are tracked too: every displayed item
 is recorded per (document, line), an accept marks its match and counts

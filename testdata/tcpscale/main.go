@@ -1,4 +1,4 @@
-// Concurrency driver for q4complete TCP servers.
+// Concurrency driver for q4tab TCP servers.
 // usage: go run ./testdata/tcpscale [clients] [reqs] [addr]
 package main
 

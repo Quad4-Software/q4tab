@@ -266,7 +266,7 @@ func TestMCPStdio(t *testing.T) {
 		t.Fatalf("protocol: %v", res)
 	}
 	si := res["serverInfo"].(map[string]any)
-	if si["name"] != "q4complete" {
+	if si["name"] != "q4tab" {
 		t.Fatalf("serverInfo: %v", si)
 	}
 

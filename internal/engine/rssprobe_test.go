@@ -20,7 +20,7 @@ func rssMB() int {
 }
 
 func TestRSSProbe(t *testing.T) {
-	p := os.Getenv("Q4COMPLETE_MODEL")
+	p := os.Getenv("Q4TAB_MODEL")
 	if p == "" {
 		t.Skip("no model")
 	}

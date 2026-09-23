@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
+	"q4tab/internal/tokenize"
 )
 
 // aux.go: the auxiliary model layers that ship inside the model file.

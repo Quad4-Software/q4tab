@@ -10,12 +10,12 @@ import (
 	"sort"
 	"sync"
 
-	"q4complete/internal/corpus"
-	"q4complete/internal/esort"
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
-	"q4complete/internal/symbols"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/corpus"
+	"q4tab/internal/esort"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
+	"q4tab/internal/symbols"
+	"q4tab/internal/tokenize"
 )
 
 // Spill build: n-gram sightings stream to sorted run files on disk and
@@ -229,9 +229,9 @@ type spillJob struct {
 // and emit n-gram records to per-worker esort streams; the collector
 // goroutine feeds the in-memory aux indexes. workers <= 0 picks a
 // default from GOMAXPROCS. spillDir holds the temporary run files; ""
-// uses the OS temp dir. Set Q4_NOS_SPILL to force the in-memory path.
+// uses the OS temp dir. Set Q4TAB_NOS_SPILL to force the in-memory path.
 func BuildIndexSpill(roots []string, order int, minCnt []uint32, tightenToks, memMB, workers int, spillDir string, progress io.Writer) (*Bundle, BuildStats, error) {
-	if os.Getenv("Q4_NOS_SPILL") != "" {
+	if os.Getenv("Q4TAB_NOS_SPILL") != "" {
 		return BuildIndexBudget(roots, order, minCnt, tightenToks, memMB, progress)
 	}
 	// A tighter GC target halves the dead-heap slack during the collect

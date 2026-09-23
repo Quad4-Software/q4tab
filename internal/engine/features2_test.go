@@ -43,11 +43,11 @@ func TestScopeFreqBoost(t *testing.T) {
 		return
 	}
 	// Killswitch: with scope off the freq signal must not apply.
-	t.Setenv("Q4_DISABLE", "scope")
+	t.Setenv("Q4TAB_DISABLE", "scope")
 	items = e.Complete("file:///p/y.go", text, len(text))
 	for _, it := range items {
 		if strings.Contains(it.Source, "scope") {
-			t.Fatalf("scope boost applied despite Q4_DISABLE=scope: %v", it.Source)
+			t.Fatalf("scope boost applied despite Q4TAB_DISABLE=scope: %v", it.Source)
 		}
 	}
 }

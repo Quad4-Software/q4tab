@@ -6,20 +6,20 @@ import (
 	"runtime"
 	"testing"
 
-	"q4complete/internal/corpus"
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/corpus"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
+	"q4tab/internal/tokenize"
 )
 
 // TestMemDiag attributes build memory to structures. Diagnostic only:
-// go test ./internal/engine -run TestMemDiag -v with Q4_MEMDIAG set to
+// go test ./internal/engine -run TestMemDiag -v with Q4TAB_MEMDIAG set to
 // a corpus root. Reports entry counts per structure plus process RSS
 // at a token checkpoint.
 func TestMemDiag(t *testing.T) {
-	root := os.Getenv("Q4_MEMDIAG")
+	root := os.Getenv("Q4TAB_MEMDIAG")
 	if root == "" {
-		t.Skip("Q4_MEMDIAG unset")
+		t.Skip("Q4TAB_MEMDIAG unset")
 	}
 	v := model.NewVocab()
 	mb := model.NewBuilder(v, 6, nil)

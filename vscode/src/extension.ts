@@ -35,7 +35,7 @@ interface CompletionResultWire {
 }
 
 const serverExe =
-  process.platform === "win32" ? "q4complete.exe" : "q4complete";
+  process.platform === "win32" ? "q4tab.exe" : "q4tab";
 
 function executable(p: string): boolean {
   try {
@@ -58,7 +58,7 @@ function resolveServerPath(
   const tried: string[] = [];
   const candidates: string[] = [];
 
-  if (configured && configured !== serverExe && configured !== "q4complete") {
+  if (configured && configured !== serverExe && configured !== "q4tab") {
     try {
       if (fs.statSync(configured).isDirectory()) {
         candidates.push(
@@ -95,14 +95,14 @@ function resolveServerPath(
 }
 
 function modelPath(): string {
-  const cfg = vscode.workspace.getConfiguration("q4complete");
+  const cfg = vscode.workspace.getConfiguration("q4tab");
   const p = cfg.get<string>("modelPath", "");
   if (p) {
     return p;
   }
   return path.join(
     process.env.HOME || "",
-    ".local/share/q4complete/model.bin",
+    ".local/share/q4tab/model.bin",
   );
 }
 
@@ -116,17 +116,17 @@ function setStatus(text: string, tooltip: string) {
 }
 
 async function startClient(context: vscode.ExtensionContext) {
-  const cfg = vscode.workspace.getConfiguration("q4complete");
+  const cfg = vscode.workspace.getConfiguration("q4tab");
   const serverAddr = cfg.get<string>("serverAddr", "");
 
   let serverOptions: ServerOptions;
   if (serverAddr) {
     // Remote mode: persistent TCP socket carrying the same LSP
-    // framing. Deploy with `q4complete serve -listen host:7917`.
+    // framing. Deploy with `q4tab serve -listen host:7917`.
     const m = /^(?:tcp:\/\/)?([^:]+):(\d+)$/.exec(serverAddr.trim());
     if (!m) {
       vscode.window.showErrorMessage(
-        `q4complete: bad serverAddr '${serverAddr}' (want host:port)`,
+        `q4tab: bad serverAddr '${serverAddr}' (want host:port)`,
       );
       return;
     }
@@ -144,13 +144,13 @@ async function startClient(context: vscode.ExtensionContext) {
   } else {
     const { command: serverPath, tried } = resolveServerPath(
       context,
-      cfg.get<string>("serverPath", "q4complete"),
+      cfg.get<string>("serverPath", "q4tab"),
     );
     log.appendLine(`server: ${serverPath} (tried: ${tried.join(", ")})`);
     const env = { ...process.env };
     const configuredModel = cfg.get<string>("modelPath", "");
     if (configuredModel) {
-      env.Q4COMPLETE_MODEL = configuredModel;
+      env.Q4TAB_MODEL = configuredModel;
     }
     serverOptions = {
       command: serverPath,
@@ -166,28 +166,28 @@ async function startClient(context: vscode.ExtensionContext) {
   };
 
   const c = new LanguageClient(
-    "q4complete",
-    "q4complete",
+    "q4tab",
+    "q4tab",
     serverOptions,
     clientOptions,
   );
 
-  setStatus("$(sync~spin) q4", "q4complete: starting server");
+  setStatus("$(sync~spin) q4", "q4tab: starting server");
   try {
     await c.start();
   } catch (err) {
     client = undefined;
     setStatus(
       "$(error) q4",
-      `q4complete: server failed to start. Click for log.`,
+      `q4tab: server failed to start. Click for log.`,
     );
-    statusBar!.command = "q4complete.openLog";
+    statusBar!.command = "q4tab.openLog";
     log.appendLine(`start failed: ${err}`);
     const target = serverAddr
       ? `server at ${serverAddr}`
       : "local server binary";
     const pick = await vscode.window.showErrorMessage(
-      `q4complete: failed to start ${target}. See the q4complete output for details.`,
+      `q4tab: failed to start ${target}. See the q4tab output for details.`,
       "Show Log",
       "Retry",
     );
@@ -199,9 +199,9 @@ async function startClient(context: vscode.ExtensionContext) {
     return;
   }
   client = c;
-  statusBar!.command = "q4complete.menu";
+  statusBar!.command = "q4tab.menu";
 
-  // Remote servers may require a bearer token (q4complete serve
+  // Remote servers may require a bearer token (q4tab serve
   // -token). Authenticate this connection before any completions.
   if (serverAddr) {
     const token = cfg.get<string>("serverToken", "");
@@ -210,9 +210,9 @@ async function startClient(context: vscode.ExtensionContext) {
         await c.sendRequest("q4/auth", { token });
       } catch (err) {
         log.appendLine(`q4/auth failed: ${err}`);
-        setStatus("$(error) q4", "q4complete: auth rejected");
+        setStatus("$(error) q4", "q4tab: auth rejected");
         vscode.window.showErrorMessage(
-          "q4complete: server rejected the configured token",
+          "q4tab: server rejected the configured token",
         );
         c.stop();
         client = undefined;
@@ -226,20 +226,20 @@ async function startClient(context: vscode.ExtensionContext) {
     const lines = stats.lines ?? 0;
     setStatus(
       lines > 0 ? `q4: ${fmtK(lines)}` : "q4: on",
-      `q4complete: ${lines} corpus lines, ${stats.vocab ?? 0} vocab, ${stats.contexts ?? 0} contexts`,
+      `q4tab: ${lines} corpus lines, ${stats.vocab ?? 0} vocab, ${stats.contexts ?? 0} contexts`,
     );
     if ((stats.contexts ?? 0) === 0) {
       const pick = await vscode.window.showWarningMessage(
-        "q4complete: no trained model found. Index your workspace to get completions.",
+        "q4tab: no trained model found. Index your workspace to get completions.",
         "Index Workspace",
         "Dismiss",
       );
       if (pick === "Index Workspace") {
-        vscode.commands.executeCommand("q4complete.indexWorkspace");
+        vscode.commands.executeCommand("q4tab.indexWorkspace");
       }
     }
   } catch (err) {
-    setStatus("q4: on", "q4complete: running (status unavailable)");
+    setStatus("q4: on", "q4tab: running (status unavailable)");
     log.appendLine(`status request failed: ${err}`);
   }
 }
@@ -273,7 +273,7 @@ async function requestCompletion(
   if (!enabled || !client) {
     return [];
   }
-  const cfg = vscode.workspace.getConfiguration("q4complete");
+  const cfg = vscode.workspace.getConfiguration("q4tab");
   const timeout = cfg.get<number>("requestTimeout", 1000);
   const params: InlineCompletionParams = {
     textDocument: { uri: document.uri.toString() },
@@ -304,7 +304,7 @@ class Q4InlineProvider implements vscode.InlineCompletionItemProvider {
     _token: vscode.CancellationToken,
   ): Promise<vscode.InlineCompletionItem[]> {
     const items = await requestCompletion(document, position);
-    const cfg = vscode.workspace.getConfiguration("q4complete");
+    const cfg = vscode.workspace.getConfiguration("q4tab");
     const max = cfg.get<number>("maxSuggestions", 4);
     // The completed line text: what the user typed on this line plus
     // the accepted suggestion. Learned lines are retrievable by the
@@ -328,7 +328,7 @@ class Q4InlineProvider implements vscode.InlineCompletionItemProvider {
       // completed line and its location so the server can correlate the
       // accept with what was shown.
       item.command = {
-        command: "q4complete.accepted",
+        command: "q4tab.accepted",
         title: "accepted",
         arguments: [
           linePrefix + it.insertText,
@@ -372,7 +372,7 @@ class Q4CompletionProvider implements vscode.CompletionItemProvider {
         );
       }
       ci.command = {
-        command: "q4complete.accepted",
+        command: "q4tab.accepted",
         title: "accepted",
         arguments: [
           linePrefix + it.insertText,
@@ -390,7 +390,7 @@ class Q4CompletionProvider implements vscode.CompletionItemProvider {
 async function indexWorkspace(context: vscode.ExtensionContext) {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
-    vscode.window.showWarningMessage("q4complete: no workspace folder open");
+    vscode.window.showWarningMessage("q4tab: no workspace folder open");
     return;
   }
   const mp = modelPath();
@@ -398,8 +398,8 @@ async function indexWorkspace(context: vscode.ExtensionContext) {
   const { command: bin } = resolveServerPath(
     context,
     vscode.workspace
-      .getConfiguration("q4complete")
-      .get<string>("serverPath", "q4complete"),
+      .getConfiguration("q4tab")
+      .get<string>("serverPath", "q4tab"),
   );
   const args = ["index"];
   if (hasModel) {
@@ -412,7 +412,7 @@ async function indexWorkspace(context: vscode.ExtensionContext) {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `q4complete: ${hasModel ? "updating" : "building"} model on workspace`,
+      title: `q4tab: ${hasModel ? "updating" : "building"} model on workspace`,
       cancellable: false,
     },
     async (progress) => {
@@ -428,14 +428,14 @@ async function indexWorkspace(context: vscode.ExtensionContext) {
         });
         proc.on("error", (err) => {
           vscode.window.showErrorMessage(
-            `q4complete: index failed to start: ${err}`,
+            `q4tab: index failed to start: ${err}`,
           );
           resolve();
         });
         proc.on("close", async (code) => {
           if (code !== 0) {
             vscode.window.showErrorMessage(
-              `q4complete: index exited with code ${code}`,
+              `q4tab: index exited with code ${code}`,
             );
             resolve();
             return;
@@ -446,17 +446,17 @@ async function indexWorkspace(context: vscode.ExtensionContext) {
                 files: number;
               };
               vscode.window.showInformationMessage(
-                `q4complete: workspace indexed (${r.files} changed files merged)`,
+                `q4tab: workspace indexed (${r.files} changed files merged)`,
               );
             } catch (err) {
               vscode.window.showInformationMessage(
-                `q4complete: indexed. Restart the server to load it.`,
+                `q4tab: indexed. Restart the server to load it.`,
               );
               log.appendLine(`reindex failed: ${err}`);
             }
           } else {
             vscode.window.showInformationMessage(
-              "q4complete: workspace indexed. Server will load it on start.",
+              "q4tab: workspace indexed. Server will load it on start.",
             );
           }
           resolve();
@@ -469,19 +469,19 @@ async function indexWorkspace(context: vscode.ExtensionContext) {
 async function showMenu() {
   const pick = await vscode.window.showQuickPick(
     [
-      { label: "$(info) Status", cmd: "q4complete.status" },
-      { label: "$(sync) Restart Server", cmd: "q4complete.restart" },
+      { label: "$(info) Status", cmd: "q4tab.status" },
+      { label: "$(sync) Restart Server", cmd: "q4tab.restart" },
       {
         label: `$(index) ${enabled ? "Disable" : "Enable"} Completions`,
-        cmd: "q4complete.toggle",
+        cmd: "q4tab.toggle",
       },
       {
         label: "$(database) Index Workspace",
-        cmd: "q4complete.indexWorkspace",
+        cmd: "q4tab.indexWorkspace",
       },
-      { label: "$(output) Show Log", cmd: "q4complete.openLog" },
+      { label: "$(output) Show Log", cmd: "q4tab.openLog" },
     ],
-    { title: "q4complete" },
+    { title: "q4tab" },
   );
   if (pick) {
     vscode.commands.executeCommand(pick.cmd);
@@ -489,19 +489,19 @@ async function showMenu() {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  log = vscode.window.createOutputChannel("q4complete", { log: true });
+  log = vscode.window.createOutputChannel("q4tab", { log: true });
   context.subscriptions.push(log);
-  log.appendLine(`q4complete activating, pid=${process.pid}`);
+  log.appendLine(`q4tab activating, pid=${process.pid}`);
 
   statusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
     100,
   );
-  statusBar.command = "q4complete.menu";
+  statusBar.command = "q4tab.menu";
   context.subscriptions.push(statusBar);
 
   enabled = vscode.workspace
-    .getConfiguration("q4complete")
+    .getConfiguration("q4tab")
     .get<boolean>("enabled", true);
 
   await startClient(context);
@@ -527,7 +527,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "q4complete.accepted",
+      "q4tab.accepted",
       async (text: string, uri?: string, line?: number) => {
         if (!client || typeof text !== "string") {
           return;
@@ -542,9 +542,9 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.status", async () => {
+    vscode.commands.registerCommand("q4tab.status", async () => {
       if (!client) {
-        vscode.window.showInformationMessage("q4complete: server not running");
+        vscode.window.showInformationMessage("q4tab: server not running");
         return;
       }
       try {
@@ -553,7 +553,7 @@ export async function activate(context: vscode.ExtensionContext) {
           any
         >;
       } catch (err) {
-        vscode.window.showErrorMessage(`q4complete: status failed: ${err}`);
+        vscode.window.showErrorMessage(`q4tab: status failed: ${err}`);
         return;
       }
       const shown = Object.entries(stats.shownN ?? {})
@@ -563,70 +563,70 @@ export async function activate(context: vscode.ExtensionContext) {
         .map(([k, v]) => `${k}:${v}`)
         .join(" ");
       vscode.window.showInformationMessage(
-        `q4complete: ${stats.lines ?? 0} lines, ${stats.vocab ?? 0} vocab, ${stats.contexts ?? 0} contexts, ${stats.docs ?? 0} docs, heap ${stats.heapMB ?? 0}MB` +
+        `q4tab: ${stats.lines ?? 0} lines, ${stats.vocab ?? 0} vocab, ${stats.contexts ?? 0} contexts, ${stats.docs ?? 0} docs, heap ${stats.heapMB ?? 0}MB` +
           (shown ? ` | shown ${shown} accepted ${accept}` : ""),
       );
     }),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.restart", async () => {
+    vscode.commands.registerCommand("q4tab.restart", async () => {
       await stopClient();
       await startClient(context);
     }),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.toggle", async () => {
+    vscode.commands.registerCommand("q4tab.toggle", async () => {
       enabled = !enabled;
       await vscode.workspace
-        .getConfiguration("q4complete")
+        .getConfiguration("q4tab")
         .update("enabled", enabled, vscode.ConfigurationTarget.Global);
       setStatus(
         enabled ? "q4: on" : "q4: off",
-        enabled ? "q4complete enabled" : "q4complete disabled",
+        enabled ? "q4tab enabled" : "q4tab disabled",
       );
       vscode.window.showInformationMessage(
-        `q4complete: ${enabled ? "enabled" : "disabled"}`,
+        `q4tab: ${enabled ? "enabled" : "disabled"}`,
       );
     }),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.indexWorkspace", () =>
+    vscode.commands.registerCommand("q4tab.indexWorkspace", () =>
       indexWorkspace(context),
     ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.trigger", () =>
+    vscode.commands.registerCommand("q4tab.trigger", () =>
       vscode.commands.executeCommand("editor.action.inlineSuggest.trigger"),
     ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.menu", showMenu),
+    vscode.commands.registerCommand("q4tab.menu", showMenu),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("q4complete.openLog", () => log.show()),
+    vscode.commands.registerCommand("q4tab.openLog", () => log.show()),
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (e) => {
       if (
-        e.affectsConfiguration("q4complete.serverPath") ||
-        e.affectsConfiguration("q4complete.modelPath") ||
-        e.affectsConfiguration("q4complete.serverAddr")
+        e.affectsConfiguration("q4tab.serverPath") ||
+        e.affectsConfiguration("q4tab.modelPath") ||
+        e.affectsConfiguration("q4tab.serverAddr")
       ) {
         await stopClient();
         await startClient(context);
       }
-      if (e.affectsConfiguration("q4complete.enabled")) {
+      if (e.affectsConfiguration("q4tab.enabled")) {
         enabled = vscode.workspace
-          .getConfiguration("q4complete")
+          .getConfiguration("q4tab")
           .get<boolean>("enabled", true);
-        setStatus(enabled ? "q4: on" : "q4: off", "q4complete");
+        setStatus(enabled ? "q4: on" : "q4: off", "q4tab");
       }
     }),
   );

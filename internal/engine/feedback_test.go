@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"q4complete/internal/lines"
+	"q4tab/internal/lines"
 )
 
 // buildEngineFrom indexes arbitrary fixture files.

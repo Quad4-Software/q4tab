@@ -1,4 +1,4 @@
-// q4complete: fully local statistical code completion.
+// q4tab: fully local statistical code completion.
 //
 // Subcommands:
 //
@@ -25,19 +25,19 @@ import (
 	"strings"
 	"time"
 
-	"q4complete/internal/corpus"
-	"q4complete/internal/engine"
-	"q4complete/internal/lines"
-	"q4complete/internal/lsp"
-	"q4complete/internal/symbols"
+	"q4tab/internal/corpus"
+	"q4tab/internal/engine"
+	"q4tab/internal/lines"
+	"q4tab/internal/lsp"
+	"q4tab/internal/symbols"
 )
 
 func defaultModelPath() string {
-	if p := os.Getenv("Q4COMPLETE_MODEL"); p != "" {
+	if p := os.Getenv("Q4TAB_MODEL"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "q4complete", "model.bin")
+	return filepath.Join(home, ".local", "share", "q4tab", "model.bin")
 }
 
 // isLoopback reports whether addr binds only to localhost.
@@ -55,23 +55,23 @@ func isLoopback(addr string) bool {
 
 func defaultCorpusDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "q4complete", "corpus")
+	return filepath.Join(home, ".local", "share", "q4tab", "corpus")
 }
 
 func defaultJournalPath() string {
-	if p := os.Getenv("Q4COMPLETE_JOURNAL"); p != "" {
+	if p := os.Getenv("Q4TAB_JOURNAL"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "q4complete", "learned.jsonl")
+	return filepath.Join(home, ".local", "share", "q4tab", "learned.jsonl")
 }
 
 func defaultConfigPath() string {
-	if p := os.Getenv("Q4COMPLETE_CONFIG"); p != "" {
+	if p := os.Getenv("Q4TAB_CONFIG"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "q4complete", "config.json")
+	return filepath.Join(home, ".config", "q4tab", "config.json")
 }
 
 type config struct {
@@ -103,7 +103,7 @@ func loadEngine(cfg config) *engine.Engine {
 	e := engine.New(ecfg)
 	bun, err := engine.Load(defaultModelPath())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "q4complete: no model at %s (%v); running with file-local completion only\n", defaultModelPath(), err)
+		fmt.Fprintf(os.Stderr, "q4tab: no model at %s (%v); running with file-local completion only\n", defaultModelPath(), err)
 		return e
 	}
 	e.SetBundle(bun)
@@ -256,7 +256,7 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 func main() {
 	log := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: q4complete <serve|index|collect|complete|stats|commitmsg> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: q4tab <serve|index|collect|complete|stats|commitmsg> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -264,7 +264,7 @@ func main() {
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		listen := fs.String("listen", "", "serve LSP over TCP on addr (e.g. 127.0.0.1:7917)")
 		httpAddr := fs.String("http", "", "serve HTTP on addr: POST /rpc, POST /mcp, GET /status, GET /healthz")
-		token := fs.String("token", os.Getenv("Q4COMPLETE_TOKEN"), "bearer token required on network endpoints (or Q4COMPLETE_TOKEN)")
+		token := fs.String("token", os.Getenv("Q4TAB_TOKEN"), "bearer token required on network endpoints (or Q4TAB_TOKEN)")
 		rate := fs.Float64("rate", 0, "sustained requests/sec per client IP (0 = unlimited)")
 		burst := fs.Int("burst", 0, "rate-limit burst (default 4x rate)")
 		maxConc := fs.Int("maxconc", 256, "max concurrent HTTP requests")
@@ -513,7 +513,7 @@ func main() {
 		limit := fs.Int("n", 10, "max results")
 		fs.Parse(os.Args[2:])
 		if fs.NArg() < 1 {
-			fmt.Fprintln(os.Stderr, "usage: q4complete symbol [-n N] <name|prefix>")
+			fmt.Fprintln(os.Stderr, "usage: q4tab symbol [-n N] <name|prefix>")
 			os.Exit(2)
 		}
 		e := loadEngine(loadConfig())
@@ -1000,7 +1000,7 @@ func runIncremental(modelPath string, roots []string, log func(string, ...any)) 
 }
 
 // watchDelta reloads the delta overlay into a running engine whenever
-// the file changes, so `q4complete watch` (or a cron'd index -incr)
+// the file changes, so `q4tab watch` (or a cron'd index -incr)
 // updates live servers without a restart. Stat-only, every 2s.
 func watchDelta(path string, e *engine.Engine, log func(string, ...any)) {
 	var lastMtime, lastSize int64

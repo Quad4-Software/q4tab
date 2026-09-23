@@ -16,7 +16,7 @@ import (
 // display time: source, score, and rank. TrainSourceWeights fits a
 // small logistic model over those events and returns a per-source
 // score multiplier. Nothing runs in the completion hot path: the
-// result is baked into Weights once, offline, by `q4complete tune`.
+// result is baked into Weights once, offline, by `q4tab tune`.
 
 // JournalEvent is one labeled accept ("a") or reject ("r") record.
 type JournalEvent struct {
@@ -158,7 +158,7 @@ func (w *Weights) ApplySourceWeights(mult map[string]float64) {
 // rescales merged candidates. Unlike ApplySourceWeights (which shifts a
 // whole source's score unit), the calibrator sees each item's blended
 // picture: source, score magnitude, shown rank, length, and whether it
-// spans lines. Trained offline by `q4complete tune` from the journal,
+// spans lines. Trained offline by `q4tab tune` from the journal,
 // applied at merge time in CompleteFor.
 type Calibrator struct {
 	Bias   float64            `json:"b"`

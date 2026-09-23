@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"q4complete/internal/commitmsg"
-	"q4complete/internal/engine"
+	"q4tab/internal/commitmsg"
+	"q4tab/internal/engine"
 )
 
 // runCommitMsg implements the commitmsg subcommand.
@@ -18,7 +18,7 @@ func runCommitMsg(args []string, log func(string, ...any)) {
 	fs := flag.NewFlagSet("commitmsg", flag.ExitOnError)
 	repo := fs.String("repo", ".", "repository root")
 	train := fs.Bool("train", false, "extract git log into a corpus dir instead of suggesting")
-	outDir := fs.String("o", "", "output dir for -train (default ~/.local/share/q4complete/commits/<repo name>)")
+	outDir := fs.String("o", "", "output dir for -train (default ~/.local/share/q4tab/commits/<repo name>)")
 	maxCommits := fs.Int("n", 2000, "max commits to extract with -train")
 	modelPath := fs.String("model", defaultModelPath(), "model path")
 	fs.Parse(args)
@@ -31,7 +31,7 @@ func runCommitMsg(args []string, log func(string, ...any)) {
 				abs = *repo
 			}
 			home, _ := os.UserHomeDir()
-			dir = filepath.Join(home, ".local", "share", "q4complete", "commits", filepath.Base(abs))
+			dir = filepath.Join(home, ".local", "share", "q4tab", "commits", filepath.Base(abs))
 		}
 		n, err := commitmsg.Extract(*repo, dir, *maxCommits)
 		if err != nil {
@@ -39,7 +39,7 @@ func runCommitMsg(args []string, log func(string, ...any)) {
 			os.Exit(1)
 		}
 		log("wrote %d commit docs to %s", n, dir)
-		log("index them with: q4complete index -root %s -o %s", dir, *modelPath)
+		log("index them with: q4tab index -root %s -o %s", dir, *modelPath)
 		return
 	}
 

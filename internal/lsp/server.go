@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"q4complete/internal/engine"
+	"q4tab/internal/engine"
 )
 
 // Server routes LSP traffic to the completion engine.
@@ -41,7 +41,7 @@ var serverCaps = json.RawMessage(`{
 		"textDocumentSync": {"openClose": true, "change": 2},
 		"inlineCompletionProvider": true,
 		"completionProvider": {"triggerCharacters": [".", " ", "(", ">", ":"]},
-		"executeCommandProvider": {"commands": ["q4complete.learn"]}
+		"executeCommandProvider": {"commands": ["q4tab.learn"]}
 	}
 }`)
 
@@ -178,7 +178,7 @@ func (s *Server) dispatchAs(user string, m *Message) (any, *rpcError) {
 			Command   string            `json:"command"`
 			Arguments []json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal(m.Params, &p); err == nil && p.Command == "q4complete.learn" && len(p.Arguments) > 0 {
+		if err := json.Unmarshal(m.Params, &p); err == nil && p.Command == "q4tab.learn" && len(p.Arguments) > 0 {
 			var text string
 			var uri string
 			var line int
@@ -290,7 +290,7 @@ func (s *Server) inlineCompletionAs(user string, p InlineCompletionParams) Inlin
 		item := InlineCompletionItem{InsertText: it.Text}
 		item.Command = &Command{
 			Title:     "accepted",
-			Command:   "q4complete.learn",
+			Command:   "q4tab.learn",
 			Arguments: []any{linePrefix + it.Text, p.TextDocument.URI, p.Position.Line},
 		}
 		if it.ReplaceToEOL {

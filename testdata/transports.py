@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive q4complete over TCP-LSP, HTTP-RPC, and MCP; report latencies."""
+"""Drive q4tab over TCP-LSP, HTTP-RPC, and MCP; report latencies."""
 import json, socket, struct, sys, time, urllib.request
 
 TCP = ("127.0.0.1", 7917)

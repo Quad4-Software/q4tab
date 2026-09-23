@@ -50,8 +50,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
 	"sort"
 )
 
@@ -341,7 +341,7 @@ func Load(path string) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if os.Getenv("Q4_DEBUG_RSS") != "" {
+	if os.Getenv("Q4TAB_DEBUG_RSS") != "" {
 		fmt.Fprintf(os.Stderr, "post-map: %s\n", rssDebug())
 	}
 	r := &reader{b: data}
@@ -574,7 +574,7 @@ func Load(path string) (*Bundle, error) {
 		}
 	}
 	_ = mapped
-	if os.Getenv("Q4_DEBUG_RSS") != "" {
+	if os.Getenv("Q4TAB_DEBUG_RSS") != "" {
 		fmt.Fprintf(os.Stderr, "post-load: %s\n", rssDebug())
 	}
 	return bun, nil
@@ -757,7 +757,7 @@ func LoadDelta(path string) ([]DeltaFile, error) {
 	return out, nil
 }
 
-// rssDebug reports current VmRSS for the Q4_DEBUG_RSS probe.
+// rssDebug reports current VmRSS for the Q4TAB_DEBUG_RSS probe.
 func rssDebug() string {
 	d, err := os.ReadFile("/proc/self/status")
 	if err != nil {
@@ -1004,7 +1004,7 @@ func (r *reader) i64s(n int) []int64 {
 	if addr := uintptr(unsafe.Pointer(&p[0])); addr%8 == 0 {
 		return unsafe.Slice((*int64)(unsafe.Pointer(&p[0])), n)
 	}
-	if os.Getenv("Q4_DEBUG_RSS") != "" {
+	if os.Getenv("Q4TAB_DEBUG_RSS") != "" {
 		fmt.Fprintf(os.Stderr, "i64s fallback at off %d n=%d\n", r.off-8*n, n)
 	}
 	out := make([]int64, n)

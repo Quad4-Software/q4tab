@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"q4complete/internal/model"
+	"q4tab/internal/model"
 )
 
 // TestStoreRoundTrip saves and reloads a built model and verifies the

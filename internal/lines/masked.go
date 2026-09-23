@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"q4complete/internal/tokenize"
+	"q4tab/internal/tokenize"
 )
 
 // masked.go implements identifier-insensitive line retrieval. The

@@ -15,8 +15,8 @@ def read_msg(f):
     return json.loads(f.read(length))
 
 e2 = dict(os.environ)
-e2.update({"Q4COMPLETE_MODEL": "bin/model.bin", "Q4COMPLETE_JOURNAL": "testdata/soak_journal.jsonl"})
-p = subprocess.Popen(["./bin/q4complete", "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=e2)
+e2.update({"Q4TAB_MODEL": "bin/model.bin", "Q4TAB_JOURNAL": "testdata/soak_journal.jsonl"})
+p = subprocess.Popen(["./bin/q4tab", "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=e2)
 
 def rss():
     try:

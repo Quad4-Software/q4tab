@@ -16,8 +16,8 @@ def read_msg(f):
 
 doc = "package x\n\nfunc h() error {\n\terr := work()\n\tif err !="
 e2 = dict(os.environ)
-e2.update({"Q4COMPLETE_MODEL": "bin/model.bin", "Q4COMPLETE_JOURNAL": "testdata/journal_test.jsonl"})
-p = subprocess.Popen(["./bin/q4complete", "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=e2)
+e2.update({"Q4TAB_MODEL": "bin/model.bin", "Q4TAB_JOURNAL": "testdata/journal_test.jsonl"})
+p = subprocess.Popen(["./bin/q4tab", "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=e2)
 p.stdin.write(frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
 p.stdin.write(frame({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.go","languageId":"go","version":1,"text":doc}}}))
 p.stdin.write(frame({"jsonrpc":"2.0","id":2,"method":"textDocument/inlineCompletion","params":{"textDocument":{"uri":"file:///x.go"},"position":{"line":4,"character":10}}}))

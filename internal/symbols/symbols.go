@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"q4complete/internal/tokenize"
+	"q4tab/internal/tokenize"
 )
 
 // Sym is one definition site.

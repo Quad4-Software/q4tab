@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"q4complete/internal/corpus"
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
-	"q4complete/internal/symbols"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/corpus"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
+	"q4tab/internal/symbols"
+	"q4tab/internal/tokenize"
 )
 
 // FileMeta is the manifest record for one indexed file: enough to detect

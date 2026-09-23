@@ -17,10 +17,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"q4complete/internal/lines"
-	"q4complete/internal/model"
-	"q4complete/internal/symbols"
-	"q4complete/internal/tokenize"
+	"q4tab/internal/lines"
+	"q4tab/internal/model"
+	"q4tab/internal/symbols"
+	"q4tab/internal/tokenize"
 )
 
 type Config struct {
@@ -175,7 +175,7 @@ type Engine struct {
 	minProb  float64 // adaptive floor. Starts at cfg.MinProb
 	winShown int     // model-source items shown since last tune
 	winAcc   int     // model-source items accepted since last tune
-	w        Weights // scoring weights. Tuned offline by `q4complete tune`
+	w        Weights // scoring weights. Tuned offline by `q4tab tune`
 
 	// users holds per-tenant overlays for hosted mode: each tenant gets
 	// a private cache + learned-line set so one server can learn each
@@ -263,7 +263,7 @@ func (e *Engine) evictUsers() {
 	}
 }
 
-// SetWeights swaps the scoring weights (see `q4complete tune`).
+// SetWeights swaps the scoring weights (see `q4tab tune`).
 // A non-nil w.Cal is installed as the rank calibrator.
 func (e *Engine) SetWeights(w Weights) {
 	e.mu.Lock()
@@ -1135,7 +1135,7 @@ func isIdentByte(c byte) bool {
 }
 
 // Feature flags for A/B debugging:
-// Q4_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed
+// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed
 const (
 	fAdapt = 1 << iota
 	fScope
@@ -1153,7 +1153,7 @@ const (
 
 func disabledFeatures() int {
 	var d int
-	for _, s := range strings.Split(os.Getenv("Q4_DISABLE"), ",") {
+	for _, s := range strings.Split(os.Getenv("Q4TAB_DISABLE"), ",") {
 		switch strings.TrimSpace(s) {
 		case "adapt":
 			d |= fAdapt

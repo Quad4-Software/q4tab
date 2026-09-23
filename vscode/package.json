@@ -1,6 +1,6 @@
 {
-  "name": "q4complete",
-  "displayName": "q4complete",
+  "name": "q4tab",
+  "displayName": "Q4 Tab",
   "description": "Fully local statistical code completion trained on your codebase. No cloud, no LLM, no GPU.",
   "version": "0.1.0",
   "publisher": "quad4",
@@ -18,39 +18,39 @@
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
-      "title": "q4complete",
+      "title": "q4tab",
       "properties": {
-        "q4complete.serverPath": {
+        "q4tab.serverPath": {
           "type": "string",
-          "default": "q4complete",
-          "description": "Path to the q4complete server binary or its containing directory. Default resolves the bundled binary, then PATH. Ignored when serverAddr is set."
+          "default": "q4tab",
+          "description": "Path to the q4tab server binary or its containing directory. Default resolves the bundled binary, then PATH. Ignored when serverAddr is set."
         },
-        "q4complete.serverAddr": {
+        "q4tab.serverAddr": {
           "type": "string",
           "default": "",
-          "description": "Remote server address host:port (deploy with 'q4complete serve -listen host:7917'). Empty = spawn the local binary over stdio."
+          "description": "Remote server address host:port (deploy with 'q4tab serve -listen host:7917'). Empty = spawn the local binary over stdio."
         },
-        "q4complete.serverToken": {
+        "q4tab.serverToken": {
           "type": "string",
           "default": "",
           "description": "Bearer token for a remote server started with -token. Sent as q4/auth after connect."
         },
-        "q4complete.modelPath": {
+        "q4tab.modelPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the trained model file (empty = default ~/.local/share/q4complete/model.bin)"
+          "description": "Path to the trained model file (empty = default ~/.local/share/q4tab/model.bin)"
         },
-        "q4complete.enabled": {
+        "q4tab.enabled": {
           "type": "boolean",
           "default": true,
           "description": "Enable inline completions"
         },
-        "q4complete.maxSuggestions": {
+        "q4tab.maxSuggestions": {
           "type": "number",
           "default": 4,
           "description": "Maximum inline completion candidates to request"
         },
-        "q4complete.requestTimeout": {
+        "q4tab.requestTimeout": {
           "type": "number",
           "default": 1000,
           "description": "Milliseconds to wait for a completion before giving up"
@@ -59,37 +59,37 @@
     },
     "commands": [
       {
-        "command": "q4complete.status",
-        "title": "q4complete: Show Status"
+        "command": "q4tab.status",
+        "title": "q4tab: Show Status"
       },
       {
-        "command": "q4complete.restart",
-        "title": "q4complete: Restart Server"
+        "command": "q4tab.restart",
+        "title": "q4tab: Restart Server"
       },
       {
-        "command": "q4complete.toggle",
-        "title": "q4complete: Toggle Completions"
+        "command": "q4tab.toggle",
+        "title": "q4tab: Toggle Completions"
       },
       {
-        "command": "q4complete.indexWorkspace",
-        "title": "q4complete: Index Workspace"
+        "command": "q4tab.indexWorkspace",
+        "title": "q4tab: Index Workspace"
       },
       {
-        "command": "q4complete.trigger",
-        "title": "q4complete: Trigger Suggestion"
+        "command": "q4tab.trigger",
+        "title": "q4tab: Trigger Suggestion"
       },
       {
-        "command": "q4complete.openLog",
-        "title": "q4complete: Show Log"
+        "command": "q4tab.openLog",
+        "title": "q4tab: Show Log"
       },
       {
-        "command": "q4complete.menu",
-        "title": "q4complete: Menu"
+        "command": "q4tab.menu",
+        "title": "q4tab: Menu"
       }
     ],
     "keybindings": [
       {
-        "command": "q4complete.trigger",
+        "command": "q4tab.trigger",
         "key": "alt+\\",
         "when": "editorTextFocus && !editorReadonly"
       }
@@ -98,7 +98,7 @@
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "typecheck": "tsc --noEmit",
-    "package": "npm run build && mkdir -p bin && cp ../bin/q4complete bin/ && vsce package --no-dependencies"
+    "package": "npm run build && mkdir -p bin && cp ../bin/q4tab bin/ && vsce package --no-dependencies"
   },
   "dependencies": {
     "vscode-languageclient": "^10.1.1"

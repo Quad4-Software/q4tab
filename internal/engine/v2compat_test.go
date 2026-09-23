@@ -8,11 +8,11 @@ import (
 // TestV2ModelCompat loads the deployed v2 model (if present) and checks
 // the JM fallback path still completes.
 func TestV2ModelCompat(t *testing.T) {
-	p := os.Getenv("Q4_V2_MODEL")
+	p := os.Getenv("Q4TAB_V2_MODEL")
 	if p == "" {
 		// The deployed model.bin is the v3 build; the v2 backup kept
 		// alongside it is the compat target.
-		p = "/home/user1/.local/share/q4complete/model-v2-backup.bin"
+		p = "/home/user1/.local/share/q4tab/model-v2-backup.bin"
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Skip("no deployed v2 model at", p)
