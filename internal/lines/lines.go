@@ -140,9 +140,13 @@ func (b *Builder) Compact() *Index {
 }
 
 // Continuation is a proposed rest-of-line with its corpus frequency.
+// Qual is a 0..1 match-quality estimate used by the masked-adapt
+// path: how specific the matched shape was and how little renaming
+// it needed. Zero means "no quality signal" (verbatim hits).
 type Continuation struct {
 	Text  string
 	Count int
+	Qual  float64
 }
 
 // Complete finds continuations for the current line prefix. prefix should

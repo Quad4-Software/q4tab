@@ -105,6 +105,14 @@ var kwClass = map[string]uint8{
 	"string": kwOther, "bool": kwOther, "float": kwOther,
 }
 
+// IsKeywordish reports whether t is a recognized keyword: the mask
+// used for identifier-insensitive retrieval keeps keywords literal so
+// structural matching keeps the line's meaning.
+func IsKeywordish(t string) bool {
+	_, ok := kwClass[t]
+	return ok
+}
+
 // Key packs the state into a table key: 4 bits brace depth (capped),
 // 1 bit in-parens/brackets, 3 bits last keyword class.
 func (s *StructState) Key() uint16 {
