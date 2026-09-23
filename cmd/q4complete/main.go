@@ -256,7 +256,7 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 func main() {
 	log := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: q4complete <serve|index|collect|complete|stats> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: q4complete <serve|index|collect|complete|stats|commitmsg> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -366,6 +366,9 @@ func main() {
 		order := fs.Int("order", 0, "n-gram order (default from config or 6)")
 		budget := fs.Int("budget", 48, "memory guard: gate low-order counting after this many million tokens (0 = off)")
 		memMB := fs.Int("mem", 0, "memory guard: RSS ceiling in MB (0 = 70% of physical memory, -1 = off)")
+		spill := fs.Bool("spill", true, "disk-spill build: bounded memory, sorts n-gram counts on disk")
+		workers := fs.Int("workers", 0, "spill build lexer/emitter workers (0 = cores - 1, capped at 8)")
+		tmpdir := fs.String("tmpdir", "", "spill build run-file directory (default = system temp)")
 		incr := fs.Bool("incr", false, "incremental: fold changed files into the delta overlay")
 		var roots multiFlag
 		fs.Var(&roots, "root", "corpus root directory (repeatable)")
@@ -396,7 +399,14 @@ func main() {
 			*memMB = 0
 		}
 		log("indexing %d roots at order %d", len(roots), *order)
-		bun, st, err := engine.BuildIndexBudget(roots, *order, nil, *budget*1_000_000, *memMB, os.Stderr)
+		var bun *engine.Bundle
+		var st engine.BuildStats
+		var err error
+		if *spill {
+			bun, st, err = engine.BuildIndexSpill(roots, *order, nil, *budget*1_000_000, *memMB, *workers, *tmpdir, os.Stderr)
+		} else {
+			bun, st, err = engine.BuildIndexBudget(roots, *order, nil, *budget*1_000_000, *memMB, os.Stderr)
+		}
 		if err != nil {
 			log("index: %v", err)
 			os.Exit(1)
@@ -422,6 +432,9 @@ func main() {
 		log("done: %d files, %d MB, %dM tokens, %d vocab, %d unique lines",
 			st.Files, st.Bytes>>20, st.Tokens/1_000_000, st.Vocab, st.Lines)
 		log("wrote %s", *out)
+
+	case "commitmsg":
+		runCommitMsg(os.Args[2:], log)
 
 	case "collect":
 		fs := flag.NewFlagSet("collect", flag.ExitOnError)
