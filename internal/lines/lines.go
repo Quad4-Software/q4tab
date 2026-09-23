@@ -63,6 +63,7 @@ type Builder struct {
 	counts map[string]int32
 	minLen int
 	maxLen int
+	frozen bool // Tighten was called: only known lines keep counting
 }
 
 func NewBuilder() *Builder {
@@ -78,7 +79,13 @@ func (b *Builder) AddFile(data []byte) {
 			start = i + 1
 			n := Normalize(string(line))
 			if len(n) >= b.minLen && len(n) <= b.maxLen {
-				b.counts[n]++
+				if b.frozen {
+					if _, ok := b.counts[n]; ok {
+						b.counts[n]++
+					}
+				} else {
+					b.counts[n]++
+				}
 			}
 		}
 	}
@@ -88,8 +95,29 @@ func (b *Builder) AddFile(data []byte) {
 func (b *Builder) AddLine(raw string) {
 	n := Normalize(raw)
 	if len(n) >= b.minLen && len(n) <= b.maxLen {
-		b.counts[n]++
+		if b.frozen {
+			if _, ok := b.counts[n]; ok {
+				b.counts[n]++
+			}
+		} else {
+			b.counts[n]++
+		}
 	}
+}
+
+// Tighten bounds memory on very large corpora: lines seen only once
+// are dropped and new lines stop accumulating, so the map converges to
+// the set of repeated lines. Rebuild rather than delete so bucket
+// memory is actually freed.
+func (b *Builder) Tighten() {
+	nm := make(map[string]int32, len(b.counts)/4)
+	for k, c := range b.counts {
+		if c >= 2 {
+			nm[k] = c
+		}
+	}
+	b.counts = nm
+	b.frozen = true
 }
 
 // Compact produces the sorted immutable index.
@@ -175,6 +203,13 @@ func (idx *Index) Complete(prefix string, limit, scanCap int) []Continuation {
 		push(last, lastCnt)
 	}
 	return tops
+}
+
+// Lookup returns the index of the exact normalized line, or false.
+// Used to bind gram-index rows to line keys.
+func (idx *Index) Lookup(norm string) (int, bool) {
+	i := sort.Search(len(idx.Cnts), func(i int) bool { return idx.Key(i) >= norm })
+	return i, i < len(idx.Cnts) && idx.Key(i) == norm
 }
 
 // HasPrefix reports whether any indexed line starts with p. p must

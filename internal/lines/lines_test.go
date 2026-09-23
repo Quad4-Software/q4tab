@@ -94,3 +94,24 @@ func TestCompleteSkipsShortRests(t *testing.T) {
 		t.Fatalf("got %+v, want only fa()", got)
 	}
 }
+
+// TestTightenDropsSingletonLines: after Tighten, lines seen once are
+// gone and new lines do not accumulate, while repeated lines keep
+// counting.
+func TestTightenDropsSingletonLines(t *testing.T) {
+	b := NewBuilder()
+	b.AddLine("alpha beta")
+	b.AddLine("alpha beta")
+	b.AddLine("gamma delta")
+	b.Tighten()
+	b.AddLine("gamma delta")  // already dropped: stays gone
+	b.AddLine("epsilon zeta") // new post-freeze line: ignored
+	b.AddLine("alpha beta")
+	idx := b.Compact()
+	if idx.Len() != 1 {
+		t.Fatalf("len=%d want 1", idx.Len())
+	}
+	if idx.Key(0) != "alpha beta" || idx.Cnts[0] != 3 {
+		t.Fatalf("got %q cnt=%d", idx.Key(0), idx.Cnts[0])
+	}
+}
