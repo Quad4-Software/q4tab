@@ -211,7 +211,7 @@ func (m *Model) DeletedInterpolation(ids []uint32) []float64 {
 			if skip {
 				break
 			}
-			toks, cnts, tot, gamma, ok := m.Orders[k].row(hashCtx(ctx), q)
+			toks, cnts, tot, gamma, ok := m.Orders[k].row(m.keyHash(ctx), q)
 			if !ok || tot <= 0 {
 				continue
 			}

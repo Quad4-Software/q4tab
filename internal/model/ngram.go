@@ -178,6 +178,21 @@ type Model struct {
 	// LamK optionally scales the backoff mass per order (deleted-
 	// interpolation weights tuned offline). Nil means 1.0 everywhere.
 	LamK []float64
+
+	// KeyMask is applied to context hashes before row lookups. Spill
+	// builds store context keys truncated to the top bits of the
+	// sortable record word, so queries must mask identically. Zero
+	// means the full 64-bit hash.
+	KeyMask uint64
+}
+
+// keyHash returns the masked context hash used for row lookups.
+func (m *Model) keyHash(ctx []uint32) uint64 {
+	h := hashCtx(ctx)
+	if m.KeyMask != 0 {
+		h &= m.KeyMask
+	}
+	return h
 }
 
 // hashCtx hashes a token-id context to a 64-bit key (FNV-1a).
@@ -201,7 +216,7 @@ func hashCtx(ctx []uint32) uint64 {
 }
 
 // nkey keys the builder's flat count maps. full is hashCtx(ctx), suf is
-// hashCtx(ctx[1:]) — the order-(k-1) row this entry's k-gram continues —
+// hashCtx(ctx[1:]), the order-(k-1) row this entry's k-gram continues,
 // and v is ctx[0]. suf and v let compaction count each (ctx',tok) pair's
 // distinct left extensions, which are the Kneser-Ney continuation counts.
 type nkey struct {
@@ -252,27 +267,13 @@ func NewBuilderDeep(v *Vocab, n, deep int, minCnt []uint32) *Builder {
 	for i := 0; i <= total; i++ {
 		b.counts[i] = make(map[nkey]uint32)
 	}
-	if len(minCnt) < total+1 {
-		m := make([]uint32, total+1)
-		copy(m, minCnt)
-		for i := len(minCnt); i <= total; i++ {
-			// Orders 1-3 keep singletons: rare identifier pairs are where
-			// codebase-specific knowledge lives. Higher orders prune at 2
-			// to bound memory on large corpora. Deep orders keep 1: the
-			// bloom gate already means a stored entry was seen at least
-			// twice, and the first sighting is not counted, so the raw
-			// count is sightings-1.
-			switch {
-			case i <= 3:
-				m[i] = 1
-			case i <= n:
-				m[i] = 2
-			default:
-				m[i] = 1
-			}
-		}
-		minCnt = m
-	}
+	// Orders 1-3 keep singletons: rare identifier pairs are where
+	// codebase-specific knowledge lives. Higher orders prune at 2
+	// to bound memory on large corpora. Deep orders keep 1: the
+	// bloom gate already means a stored entry was seen at least
+	// twice, and the first sighting is not counted, so the raw
+	// count is sightings-1.
+	minCnt = DefaultMinCnt(n, deep, minCnt)
 	b.minCnt = minCnt
 	// Every order with a min count >= 2 is bloom-gated: a context seen
 	// once can never survive pruning, so the flat map only pays for
@@ -328,7 +329,7 @@ func (b *Builder) Tighten(minOrder int) {
 
 // Freeze stops gated orders from accepting new (ctx,tok) keys: only
 // keys already in the map keep counting. Called when Tighten alone does
-// not bound memory — on very large corpora the set of repeated contexts
+// not bound memory. On very large corpora the set of repeated contexts
 // still grows without limit. Entries counted only once since gating
 // are dropped first so the retained map is the set of genuinely hot
 // contexts.
@@ -402,6 +403,73 @@ func (b *Builder) Add(ids []uint32) {
 	}
 }
 
+// EmitNGrams calls emit for every n-gram sighting in ids with the same
+// context semantics as Builder.Add: orders 1..n+deep, contexts do not
+// cross EOF. The callback receives the order, the full context hash,
+// the suffix context hash (the order k-1 context), the left-extension
+// token ctx[0] (0 at order 1), and the predicted token. Used by the
+// spilling index build, which aggregates sightings on disk instead of
+// in flat maps.
+func EmitNGrams(v *Vocab, n, deep int, ids []uint32, emit func(k int, full, suf uint64, x, tok uint32)) {
+	eof := eofID(v)
+	maxOrder := n + deep
+	for i := 0; i < len(ids); i++ {
+		tok := ids[i]
+		if tok == eof {
+			continue
+		}
+		maxK := i + 1
+		if maxK > maxOrder {
+			maxK = maxOrder
+		}
+		hPrev := hashCtx(nil)
+		for k := 1; k <= maxK; k++ {
+			ctx := ids[i-k+1 : i]
+			eofIn := false
+			for _, c := range ctx {
+				if c == eof {
+					eofIn = true
+					break
+				}
+			}
+			if eofIn {
+				continue
+			}
+			var x uint32
+			if len(ctx) > 0 {
+				x = ctx[0]
+			}
+			h := hashCtx(ctx)
+			emit(k, h, hPrev, x, tok)
+			hPrev = h
+		}
+	}
+}
+
+// DefaultMinCnt expands a partial min-count list to orders 0..n+deep
+// with the standard defaults: orders 1-3 keep singletons, orders 4..n
+// prune at 2, deep orders prune at 1 (the bloom gate means a stored
+// deep entry was seen at least twice).
+func DefaultMinCnt(n, deep int, minCnt []uint32) []uint32 {
+	total := n + deep
+	if len(minCnt) >= total+1 {
+		return minCnt
+	}
+	m := make([]uint32, total+1)
+	copy(m, minCnt)
+	for i := len(minCnt); i <= total; i++ {
+		switch {
+		case i <= 3:
+			m[i] = 1
+		case i <= n:
+			m[i] = 2
+		default:
+			m[i] = 1
+		}
+	}
+	return m
+}
+
 func eofID(v *Vocab) uint32 {
 	id, ok := v.Lookup("<eof>")
 	if !ok {
@@ -434,9 +502,14 @@ type ck struct {
 	tok uint32
 }
 
-// knDiscounts derives the modified Kneser-Ney tiered discounts from
+// KNDiscounts derives the modified Kneser-Ney tiered discounts from
 // counts-of-counts (Chen & Goodman): D1 = 1-2Y(n2/n1), D2 = 2-3Y(n3/n2),
-// D3 = 3-4Y(n4/n3) with Y = n1/(n1+2n2).
+// D3 = 3-4Y(n4/n3) with Y = n1/(n1+2n2). Exported for the spill-build
+// path, which assembles orders without Builder.
+func KNDiscounts(n1, n2, n3, n4 int64) [3]float64 {
+	return knDiscounts(n1, n2, n3, n4)
+}
+
 func knDiscounts(n1, n2, n3, n4 int64) [3]float64 {
 	if n1 == 0 || n2 == 0 || n3 == 0 {
 		return [3]float64{0.5, 0.67, 0.8}
@@ -461,7 +534,7 @@ func knDiscounts(n1, n2, n3, n4 int64) [3]float64 {
 // Entries are sorted once per order (ctx asc, count desc) so each
 // context's row lands contiguous and pre-sorted in the CSR arrays.
 //
-// Modified Kneser-Ney layout: orders 2..n-1 store continuation counts —
+// Modified Kneser-Ney layout: orders 2..n-1 store continuation counts.
 // for each (ctx,tok) entry, the number of distinct left extensions of
 // that k-gram. Orders n..n+deep store raw counts: n is the boundary
 // because deep orders are bloom-gated to repeat contexts and cannot
@@ -654,7 +727,7 @@ func (m *Model) probAtOrder(tok uint32, ctx []uint32, k int, lam float64, q *Que
 		return m.probKN(tok, ctx, k, q)
 	}
 	if k <= 0 || len(ctx) == 0 {
-		toks, cnts, tot, _, ok := m.Orders[1].row(hashCtx(nil), q)
+		toks, cnts, tot, _, ok := m.Orders[1].row(m.keyHash(nil), q)
 		if !ok {
 			return 1e-9
 		}
@@ -673,7 +746,7 @@ func (m *Model) probAtOrder(tok uint32, ctx []uint32, k int, lam float64, q *Que
 	if len(useCtx) > k-1 {
 		useCtx = useCtx[len(useCtx)-(k-1):]
 	}
-	toks, cnts, tot, _, ok := m.Orders[k].row(hashCtx(useCtx), q)
+	toks, cnts, tot, _, ok := m.Orders[k].row(m.keyHash(useCtx), q)
 	lower := m.probAtOrder(tok, ctx[1:], k-1, lam, q)
 	if !ok {
 		return lower
@@ -720,7 +793,7 @@ func (m *Model) probKN(tok uint32, ctx []uint32, k int, q *Query) float64 {
 		// Not enough context for this order: drop straight down.
 		return m.probKN(tok, ctx[1:], k-1, q)
 	}
-	toks, cnts, tot, gamma, ok := m.Orders[k].row(hashCtx(useCtx), q)
+	toks, cnts, tot, gamma, ok := m.Orders[k].row(m.keyHash(useCtx), q)
 	if !ok || tot <= 0 {
 		return m.probKN(tok, ctx[1:], k-1, q)
 	}
@@ -764,7 +837,7 @@ func (m *Model) Top(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
 			}
 			ok = len(toks) > 0
 		} else {
-			toks, cnts, tot, _, ok = m.Orders[k].row(hashCtx(useCtx), q)
+			toks, cnts, tot, _, ok = m.Orders[k].row(m.keyHash(useCtx), q)
 		}
 		if !ok || len(toks) == 0 {
 			continue
@@ -810,7 +883,7 @@ func (m *Model) TopUnion(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
 		} else {
 			continue
 		}
-		row, _, _, _, ok := m.Orders[k].row(hashCtx(useCtx), q)
+		row, _, _, _, ok := m.Orders[k].row(m.keyHash(useCtx), q)
 		if !ok {
 			continue
 		}
@@ -834,7 +907,7 @@ func (m *Model) TopUnion(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
 	}
 	if !m.KN && len(toks) == 0 {
 		// v2 models keep the order-1 row in the order table.
-		row, _, _, _, ok := m.Orders[1].row(hashCtx(nil), q)
+		row, _, _, _, ok := m.Orders[1].row(m.keyHash(nil), q)
 		if ok {
 			limit := len(row)
 			if limit > 32 {
@@ -871,4 +944,13 @@ func (m *Model) TopUnion(ctx []uint32, lam float64, maxK int, q *Query) []Cand {
 type Cand struct {
 	Tok uint32
 	P   float64
+}
+
+// OrderLen returns the number of flat-map entries at order k. Used by
+// diagnostics and tests.
+func (b *Builder) OrderLen(k int) int {
+	if k < 0 || k >= len(b.counts) {
+		return 0
+	}
+	return len(b.counts[k])
 }
