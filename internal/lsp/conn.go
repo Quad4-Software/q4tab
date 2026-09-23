@@ -117,12 +117,3 @@ func (c *Conn) RespondError(id json.RawMessage, code int, msg string) error {
 		Message string `json:"message"`
 	}{code, msg}})
 }
-
-// Notify sends a server-to-client notification.
-func (c *Conn) Notify(method string, params any) error {
-	return c.write(struct {
-		JSONRPC string `json:"jsonrpc"`
-		Method  string `json:"method"`
-		Params  any    `json:"params,omitempty"`
-	}{"2.0", method, params})
-}

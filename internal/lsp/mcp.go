@@ -110,10 +110,6 @@ func (m *MCPServer) handleFrame(user string, raw []byte, enc *json.Encoder, bw *
 	}
 }
 
-func (m *MCPServer) dispatch(msg *Message) (any, *rpcError) {
-	return m.dispatchAs("", msg)
-}
-
 // dispatchAs is dispatch plus a tenant id for per-user learning.
 func (m *MCPServer) dispatchAs(user string, msg *Message) (any, *rpcError) {
 	switch msg.Method {

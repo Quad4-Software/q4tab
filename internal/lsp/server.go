@@ -84,11 +84,6 @@ func (s *Server) request(m *Message) {
 	s.conn.Respond(m.ID, res)
 }
 
-// dispatch routes a request for the connection's tenant.
-func (s *Server) dispatch(m *Message) (any, *rpcError) {
-	return s.dispatchAs(s.user, m)
-}
-
 // dispatchAs routes a request and returns its result or error without
 // touching the transport, so TCP and HTTP frontends share the logic.
 // user selects the tenant overlay (empty = shared/global).
@@ -280,15 +275,10 @@ func (s *Server) docText(uri string) string {
 	return s.docs[uri]
 }
 
-func (s *Server) inlineCompletion(p InlineCompletionParams) InlineCompletionList {
-	return s.inlineCompletionAs("", p)
-}
-
 func (s *Server) inlineCompletionAs(user string, p InlineCompletionParams) InlineCompletionList {
 	text := s.docText(p.TextDocument.URI)
-	if text == "" {
-		return InlineCompletionList{Items: []InlineCompletionItem{}}
-	}
+	// Empty text is still a valid request: thin-context priors
+	// (file-start lines, package clauses) answer it.
 	off := offsetAt(text, p.Position)
 	items := s.eng.CompleteFor(user, p.TextDocument.URI, text, off)
 	// The completed-line text is computed server-side so generic clients
@@ -352,15 +342,10 @@ func utf16Len(s string) int {
 	return n
 }
 
-func (s *Server) completion(p CompletionParams) CompletionList {
-	return s.completionAs("", p)
-}
-
 func (s *Server) completionAs(user string, p CompletionParams) CompletionList {
 	text := s.docText(p.TextDocument.URI)
-	if text == "" {
-		return CompletionList{IsIncomplete: false, Items: []CompletionItem{}}
-	}
+	// Empty text is still a valid request: thin-context priors
+	// (file-start lines, package clauses) answer it.
 	off := offsetAt(text, p.Position)
 	items := s.eng.CompleteFor(user, p.TextDocument.URI, text, off)
 	out := make([]CompletionItem, 0, len(items))
@@ -381,12 +366,4 @@ func (s *Server) completionAs(user string, p CompletionParams) CompletionList {
 		})
 	}
 	return CompletionList{IsIncomplete: false, Items: out}
-}
-
-// LogSend writes a window/logMessage notification.
-func (s *Server) LogSend(msg string) {
-	s.conn.Notify("window/logMessage", struct {
-		Type    int    `json:"type"`
-		Message string `json:"message"`
-	}{3, msg})
 }
