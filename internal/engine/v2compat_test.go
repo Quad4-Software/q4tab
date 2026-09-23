@@ -2,6 +2,7 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestV2ModelCompat(t *testing.T) {
 	if p == "" {
 		// The deployed model.bin is the v3 build; the v2 backup kept
 		// alongside it is the compat target.
-		p = "/home/user1/.local/share/q4tab/model-v2-backup.bin"
+		p = filepath.Join(os.Getenv("HOME"), ".local/share/q4tab/model-v2-backup.bin")
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Skip("no deployed v2 model at", p)
