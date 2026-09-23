@@ -11,3 +11,4 @@ coverage.out
 testdata/*.jsonl
 testdata/*.out
 testdata/tcpscale/tcpscale
+dist/
