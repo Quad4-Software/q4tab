@@ -20,21 +20,32 @@ Type "nvim -u init.lua main.go"
 Enter
 # LSP attach + model warmup, hidden so the gif starts ready
 Sleep 6s
-Type "5j"
+Type "12j"
 Show
 Sleep 400ms
+
+# beat 1: defer
 Type "i"
-Type "fmt.Pri"
+Type "defer f."
 Sleep 2.5s
 Tab
 Sleep 500ms
 
+# beat 2: fmt call
+Escape
+Type "o"
+Type "fmt."
+Sleep 2.5s
+Tab
+Sleep 500ms
+
+# beat 3: loop with trailing multi-line ghost
 Escape
 Type "o"
 Type "for i :="
 Sleep 2.5s
 Tab
-Sleep 1.2s
+Sleep 1.8s
 
 Hide
 Escape
