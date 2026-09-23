@@ -27,19 +27,27 @@ q4complete index --root ~/projects --root ~/corpus
 
 The model lands in `~/.local/share/q4complete/model.bin` plus a
 `model.bin.manifest` used for incremental updates. Re-run `index`
-nightly or after big changes. For scale reference: 231k files / 332M
-tokens of mixed source indexes in about 25 minutes on a desktop CPU and
-produces a ~1.4GB packed model (format v3, varint-compressed, and v2
-files still load). The file
-is mmap'd read-only, so it loads in well under a second and only ~100MB
+nightly or after big changes. For scale reference: 247k files / 272M
+tokens of mixed source (after content dedup) indexes in about 7 minutes
+on a desktop CPU and produces a ~2.8GB packed model (format v4, varint
+row streams, v2 and v3 files still load). The file
+is mmap'd read-only, so it loads in well under a second and only ~340MB
 stays resident. The rest faults in on demand and can be reclaimed by the
 OS under pressure.
 
-Very large corpora are guarded automatically: once the build passes
-`-budget` million tokens (default 48) low-order counting switches to
-bloom-gated repeat-only storage, and if RSS approaches `-mem` MB
-(default 70% of physical memory) gated orders freeze and only already
-known contexts keep counting. `-budget 0 -mem -1` disables both.
+The default build is a disk-spill pipeline: workers lex and emit n-gram
+sightings into sorted run files (`-tmpdir`, default system temp, needs
+a few GB of scratch), then a k-way merge assembles the packed tables.
+Peak RSS stays around 6-7GB regardless of corpus size instead of
+scaling with token count. `-workers` sets the lexer/emitter pool
+(default cores - 1, capped at 8). `-spill=false` selects the older
+in-memory path. Duplicate file contents are indexed once; generated
+files, lockfiles, vendored and minified sources are skipped.
+
+For the in-memory path and the in-memory aux indexes under spill,
+`-budget` million tokens (default 48) tightens counting to repeat-only
+storage, and if RSS approaches `-mem` MB (default 70% of physical
+memory) the aux indexes freeze. `-budget 0 -mem -1` disables both.
 
 ### Incremental index
 
@@ -66,6 +74,26 @@ latency per language. Add `-v` to print misses. On the org corpus it
 measures ~75% hit@1, ~90% hit@k, ~1ms p50.
 
 `go test -fuzz=FuzzLex ./internal/tokenize/` fuzzes the lexer.
+
+## Commit messages
+
+`commitmsg` drafts conventional-commit messages from your staged diff.
+It learns the repo's own conventions from git history rather than a
+general model, so `feat:` vs `add:` comes out however the project
+actually writes it:
+
+```sh
+q4complete commitmsg -train -repo . -o ~/.local/share/q4complete/commits/myrepo
+q4complete index -root ~/.local/share/q4complete/commits/myrepo -o /tmp/commit-model.q4m
+git add -p && q4complete commitmsg -model /tmp/commit-model.q4m
+```
+
+`-train` rewrites `git log -p` into diff-to-message documents. Suggest
+mode reads `git diff --cached` (falling back to unstaged), infers the
+type and scope from the changed paths, and prints up to 5 candidates:
+model completions first, then a `type(scope): update <path>` fallback.
+It names the right identifiers and repo conventions, but it retrieves
+rather than summarizes. Treat the output as a starting point.
 
 Config is `~/.config/q4complete/config.json`:
 
