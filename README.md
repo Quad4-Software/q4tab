@@ -210,61 +210,16 @@ q4tab stats
 
 ## How it works
 
-- `internal/tokenize` language-agnostic lexer with identifier subtoken
-  splitting (camelCase, snake_case, digits)
-- `internal/model` order-6 n-gram with modified Kneser-Ney smoothing
-  plus bloom-gated deep orders storing only repeated contexts, and
-  scoped caches
-- `internal/lines` sorted unique-line index for verbatim continuations
-  and a line n-gram table
-- `internal/engine` merges the layers, tracks open docs, decodes
-  multi-line blocks with bracket and indent awareness, and applies a
-  journal-trained rank calibrator
-- `internal/lsp` JSON-RPC server over stdio, TCP, and HTTP
-
-Ranking order: same-file repetition, then lines from open files and
-accepted completions, then corpus verbatim matches, then n-gram
-generation.
-
-### Multi-line completion
-
-At end of line the engine may emit a whole block. Generation stops at
-the line cap, at a dedent below the cursor's bracket depth, when it
-would reproduce text after the cursor, or when confidence drops.
-Indentation is rewritten into the document's own indent unit.
-
-### Learning from accepts
-
-Accepted completions are reported via `q4/learn` (the extension wires
-this automatically) and appended to `~/.local/share/q4tab/learned.jsonl`.
-The journal replays on startup, feeds the learned cache and dynamic
-line index, and self-compacts at 4MB. `Q4TAB_JOURNAL` relocates it.
-
-Shown-but-not-accepted items count as implicit rejects; per-source
-accept rates drive a bounded adaptive floor on the model threshold.
-Counters are visible in `q4/status`.
-
-### Fill-in-the-middle
-
-When the cursor sits mid-line, a suggestion ending with the existing
-tail becomes a zero-width insert of only the missing middle. Everything
-else keeps a replace-to-EOL range.
-
-### Directory scope
-
-Files in the same directory share a cache, so idioms from sibling files
-surface before the session cache warms up. Capped at 64 directories.
-
-### Edge cases
-
-- UTF-16 position mapping including astral characters and CRLF
-- Incremental `didChange` sync, not full-document resends
-- Never suggests text already after the cursor
-- Documents over 128KB index in a background worker
-- Corrupt models fail with an error, panics degrade to no suggestions
-- Malformed or oversized JSON-RPC frames are skipped, not fatal
-
-### Honest limits
+Retrieval first, generation second: the engine searches your corpus
+and open files for lines that match what you are typing (rebinding
+identifiers to your names when shapes match), and falls back to a
+Kneser-Ney n-gram decode when nothing attested fits. Accepts and
+rejects feed back into ranking. See
+[docs/architecture.md](docs/architecture.md),
+[docs/model.md](docs/model.md),
+[docs/retrieval.md](docs/retrieval.md),
+[docs/ranking.md](docs/ranking.md), and
+[docs/protocol.md](docs/protocol.md).
 
 It finishes lines and blocks it has seen before; it cannot invent APIs
 it has never seen. What it knows is exactly what your corpus and open
