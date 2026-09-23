@@ -27,12 +27,19 @@ q4complete index --root ~/projects --root ~/corpus
 
 The model lands in `~/.local/share/q4complete/model.bin` plus a
 `model.bin.manifest` used for incremental updates. Re-run `index`
-nightly or after big changes. For scale reference: 53k files / 79M
-tokens of the org's code indexes in about 4 minutes on a desktop CPU and
-produces an ~680MB packed model (format v2, varint-compressed). The file
+nightly or after big changes. For scale reference: 231k files / 332M
+tokens of mixed source indexes in about 25 minutes on a desktop CPU and
+produces a ~1.4GB packed model (format v3, varint-compressed, and v2
+files still load). The file
 is mmap'd read-only, so it loads in well under a second and only ~100MB
 stays resident. The rest faults in on demand and can be reclaimed by the
 OS under pressure.
+
+Very large corpora are guarded automatically: once the build passes
+`-budget` million tokens (default 48) low-order counting switches to
+bloom-gated repeat-only storage, and if RSS approaches `-mem` MB
+(default 70% of physical memory) gated orders freeze and only already
+known contexts keep counting. `-budget 0 -mem -1` disables both.
 
 ### Incremental index
 
@@ -206,17 +213,23 @@ q4complete stats
 
 ## How it works
 
-- `internal/tokenize` language-agnostic lexer
-- `internal/model` order-6 n-gram with interpolated backoff and scoped
-  caches (Hellendoorn and Devanbu 2017 style locality)
+- `internal/tokenize` language-agnostic lexer with identifier subtoken
+  splitting (camelCase, snake_case, digits)
+- `internal/model` order-6 n-gram with modified Kneser-Ney smoothing
+  (continuation counts, tiered discounts) plus two bloom-gated deep
+  orders that store only repeated verbatim contexts, and scoped caches
+  (Hellendoorn and Devanbu 2017 style locality)
 - `internal/lines` sorted unique-line index for verbatim continuations
+  plus a line n-gram table: previous line(s) -> likely next line
 - `internal/engine` merges the layers, tracks open docs, greedy
-  multi-line decode with bracket-depth and indentation awareness
+  multi-line decode with bracket-depth and indentation awareness,
+  structural-context and per-language vote tables, and a journal-trained
+  rank calibrator
 - `internal/lsp` JSON-RPC stdio server
 
 Ranking: same-file repetition first, then lines from other open files
 and accepted completions, then corpus verbatim matches, then n-gram
-generation.
+generation conditioned on the lexical context.
 
 ### Multi-line completion
 
