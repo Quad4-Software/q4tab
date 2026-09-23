@@ -4,5 +4,10 @@ node_modules/
 *.vsix
 *.bin
 engine.test
+*.prof
+*.log
+coverage.out
+.vscode-test/
 testdata/*.jsonl
 testdata/*.out
+testdata/tcpscale/tcpscale
