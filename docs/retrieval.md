@@ -58,6 +58,26 @@ sampled from the corpus for the detected language, plus a Go package
 clause inferred from the directory name. An empty `x.go` in `store/`
 offers `package store`.
 
+## Member memory
+
+The line index is textual, so a bare `x.` at the cursor used to fall
+back to whatever receivers were popular in the corpus. The member
+layer fixes that with lightweight fact extraction, not a typechecker:
+
+- `func (r *T) M(` records `M` as a member of `T` and `r` as holding
+  type `T`
+- `type T struct { f U }` records field `f` and its type, so
+  `x.field.` chains resolve
+- `x := NewT(`, `var x T`, and typed parameters record `x` as `T`
+- `F(...)` followed by `.M` records `M` as a member seen on `F`'s
+  result, so `json.NewDecoder(r).` offers `Decode(`
+
+Facts are extracted per open document, merged into a session table,
+and persisted into the model at index time. At a dot the receiver
+expression resolves doc-first, then session, then corpus. Resolved
+members emit directly as candidates and boost retrieved candidates
+that begin with a member name.
+
 ## Import adjacency
 
 The build records the top identifiers per directory. At query time the

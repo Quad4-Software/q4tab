@@ -15,9 +15,19 @@ in-scope identifiers).
 | `prior` | file-start prior for thin contexts |
 | `lineBi` | line n-gram hit |
 | `model` | n-gram chain decode |
+| `mem` | member memory: resolved receiver members, arg synthesis |
 | `fim` / `fimIdx` | verified fill-in-the-middle |
 | `scope` | in-scope identifier reuse boost |
 | `struct` / `lang` | structural and per-language table votes |
+
+## Plausibility filter
+
+Before ranking, candidates that cannot sit at the cursor are dropped:
+anything not starting with a member name after a `.`, an opening
+brace right after one, prose fragments that leaked into the line
+index (a capitalized word followed by a lowercase word), and
+declaration material like scalar type keywords or struct tags in
+operand position.
 
 ## Scope boost
 
@@ -59,5 +69,5 @@ relocates the journal.
 Every feature can be disabled individually for debugging:
 
 ```sh
-Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed q4tab serve
+Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem q4tab serve
 ```

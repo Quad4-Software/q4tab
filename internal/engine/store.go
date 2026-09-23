@@ -233,6 +233,12 @@ func Save(path string, b *Bundle) error {
 	} else {
 		putU32(w, 0)
 	}
+
+	// Member-memory tables: type -> members and func -> members seen
+	// on its result. Trailing sections; older readers stop at their
+	// last known section.
+	putStrTable(w, b.TypeMem)
+	putStrTable(w, b.CallMem)
 	if w.err != nil {
 		return fail(w.err)
 	}
@@ -241,6 +247,31 @@ func Save(path string, b *Bundle) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// putStrTable writes a map[string][]string section in the shared
+// DirIdents/TypeMem/CallMem encoding: u32 count, then per key a u16
+// name, u32 count, and u16-length strings.
+func putStrTable(w *countingWriter, m map[string][]string) {
+	if len(m) == 0 {
+		putU32(w, 0)
+		return
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	putU32(w, uint32(len(keys)))
+	for _, k := range keys {
+		putU16(w, uint16(len(k)))
+		w.Write([]byte(k))
+		putU32(w, uint32(len(m[k])))
+		for _, s := range m[k] {
+			putU16(w, uint16(len(s)))
+			w.Write([]byte(s))
+		}
+	}
 }
 
 // writeOrder emits one order section. In-memory orders (fresh builds)
@@ -572,11 +603,51 @@ func Load(path string) (*Bundle, error) {
 			}
 		}
 	}
+	if hasAux() {
+		bun.TypeMem = readStrTable(r, "type-member")
+		if r.err != nil {
+			return nil, fmt.Errorf("model: truncated type-member section")
+		}
+	}
+	if hasAux() {
+		bun.CallMem = readStrTable(r, "call-member")
+		if r.err != nil {
+			return nil, fmt.Errorf("model: truncated call-member section")
+		}
+	}
 	_ = mapped
 	if os.Getenv("Q4TAB_DEBUG_RSS") != "" {
 		fmt.Fprintf(os.Stderr, "post-load: %s\n", rssDebug())
 	}
 	return bun, nil
+}
+
+// readStrTable reads a map[string][]string section written by
+// putStrTable. Bounds are defensive against corrupt models.
+func readStrTable(r *reader, what string) map[string][]string {
+	nk := int(r.u32())
+	if nk < 0 || nk > 1<<20 || r.err != nil {
+		r.err = fmt.Errorf("model: bad %s header", what)
+		return nil
+	}
+	if nk == 0 {
+		return nil
+	}
+	out := make(map[string][]string, nk)
+	for i := 0; i < nk; i++ {
+		k := string(r.bytes(int(r.u16())))
+		ns := int(r.u32())
+		if ns < 0 || ns > 1024 || r.err != nil {
+			r.err = fmt.Errorf("model: bad %s row", what)
+			return nil
+		}
+		ls := make([]string, ns)
+		for j := range ls {
+			ls[j] = string(r.bytes(int(r.u16())))
+		}
+		out[k] = ls
+	}
+	return out
 }
 
 // loadV12 reads the legacy v1/v2 format: magic Q4C2 already consumed.

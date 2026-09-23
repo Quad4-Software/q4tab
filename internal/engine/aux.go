@@ -47,6 +47,14 @@ type Bundle struct {
 	// built around. Powers the directory-level cache and the
 	// import-adjacency boost.
 	DirIdents map[string][]string
+	// TypeMem maps a type name to its observed members across the
+	// corpus ("Name(" for methods, "Name" for fields). Powers the
+	// member completion at "recv." when the receiver's type is known.
+	TypeMem map[string][]string
+	// CallMem maps a function name to members observed being invoked
+	// on its result: NewDecoder -> Decode, NewEncoder -> Encode.
+	// Powers completion at "f(...)." call receivers.
+	CallMem map[string][]string
 }
 
 // LangOf classifies a path or URI into a language bucket. Extensions

@@ -96,6 +96,7 @@ type doc struct {
 	gen   int // bumped per UpdateDoc. Stale builds are dropped
 	cache *model.Cache
 	lines []string // normalized nonblank lines, for the dynamic index
+	facts *facts   // member-memory extraction, merged into sessFacts
 }
 
 // Engine is the live completion state: static model + line index plus
@@ -147,16 +148,19 @@ type Engine struct {
 
 	// Auxiliary model layers from the v3 bundle. All optional; a nil
 	// field disables that layer cleanly.
-	lineBi  *lines.GramIndex            // previous line(s) -> next line
-	struc   *model.Order                // lexical-context -> token counts
-	langs   map[string]*model.LangTable // per-language low-order tables
-	sub     *model.Model                // identifier subtoken model
-	idents  *model.IdentIndex           // subtoken path -> ident ids
-	cal     *Calibrator                 // journal-trained rank calibrator
-	mli     *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
-	fstarts map[string][]string         // lang -> common first lines of a file
-	dirIds  map[string][]string         // dir -> top idents (dir cache + import adjacency)
-	dirSuf  map[string][]string         // path suffix -> dirs, for import resolution
+	lineBi    *lines.GramIndex            // previous line(s) -> next line
+	struc     *model.Order                // lexical-context -> token counts
+	langs     map[string]*model.LangTable // per-language low-order tables
+	sub       *model.Model                // identifier subtoken model
+	idents    *model.IdentIndex           // subtoken path -> ident ids
+	cal       *Calibrator                 // journal-trained rank calibrator
+	mli       *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
+	fstarts   map[string][]string         // lang -> common first lines of a file
+	dirIds    map[string][]string         // dir -> top idents (dir cache + import adjacency)
+	dirSuf    map[string][]string         // path suffix -> dirs, for import resolution
+	tyMem     map[string][]string         // corpus type -> members (member memory)
+	callMem   map[string][]string         // corpus func -> member called on result
+	sessFacts *facts                      // merged member facts over open docs
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -286,6 +290,7 @@ func (e *Engine) bundle() *Bundle {
 		M: e.m, Lines: e.li, LineBi: e.lineBi, Struct: e.struc,
 		Langs: e.langs, Sub: e.sub, Idents: e.idents,
 		FileStarts: e.fstarts, DirIdents: e.dirIds,
+		TypeMem: e.tyMem, CallMem: e.callMem,
 	}
 }
 
@@ -303,6 +308,8 @@ func (e *Engine) SetBundle(b *Bundle) {
 	e.fstarts = b.FileStarts
 	e.dirIds = b.DirIdents
 	e.dirSuf = buildDirSuf(b.DirIdents)
+	e.tyMem = b.TypeMem
+	e.callMem = b.CallMem
 }
 
 // buildDirSuf indexes directory paths by their last 1-3 segments so an
@@ -967,6 +974,7 @@ func (e *Engine) drainOnce() bool {
 		ids   []uint32
 		cache *model.Cache
 		lines []string
+		facts *facts
 	}
 	var bs []built
 	for _, t := range tasks {
@@ -980,7 +988,8 @@ func (e *Engine) drainOnce() bool {
 			c = model.NewCache(e.cfg.CacheOrdr)
 			c.Add(ids, e.eofID)
 		}
-		bs = append(bs, built{t, ids, c, docLines(t.text)})
+		bs = append(bs, built{t, ids, c, docLines(t.text),
+			extractFactsToks(tokenize.Lex([]byte(t.text)))})
 	}
 
 	// Install per-doc results under each doc's own lock. Docs updated
@@ -992,6 +1001,7 @@ func (e *Engine) drainOnce() bool {
 		if b.d.gen == b.gen {
 			b.d.cache = b.cache
 			b.d.lines = b.lines
+			b.d.facts = b.facts
 			live = append(live, b)
 		}
 		b.d.mu.Unlock()
@@ -1028,18 +1038,24 @@ func (e *Engine) drainOnce() bool {
 		}
 	}
 	// Snapshot for the dynamic index rebuild: docs map is lock-free,
-	// learnLines/deltaLines need e.mu.
+	// learnLines/deltaLines need e.mu. Member facts merge here too so
+	// "s.st." can see the methods a sibling doc declares.
 	var src [][]string
 	if rebuild {
+		sf := newFacts()
 		e.docs.Range(func(_, v any) bool {
 			d := v.(*doc)
 			d.mu.Lock()
 			if len(d.lines) > 0 {
 				src = append(src, d.lines)
 			}
+			if d.facts != nil {
+				sf.merge(d.facts)
+			}
 			d.mu.Unlock()
 			return true
 		})
+		e.sessFacts = sf
 		src = append(src, e.learnLines, e.deltaLines)
 	}
 	e.mu.Unlock()
@@ -1135,7 +1151,7 @@ func isIdentByte(c byte) bool {
 }
 
 // Feature flags for A/B debugging:
-// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed
+// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem
 const (
 	fAdapt = 1 << iota
 	fScope
@@ -1149,6 +1165,7 @@ const (
 	fMMR
 	fSrc
 	fEmbed
+	fMem
 )
 
 func disabledFeatures() int {
@@ -1179,6 +1196,8 @@ func disabledFeatures() int {
 			d |= fSrc
 		case "embed":
 			d |= fEmbed
+		case "mem":
+			d |= fMem
 		}
 	}
 	return d
@@ -1522,6 +1541,71 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 		items = append(items, extra...)
 
+		// Member memory: resolve the receiver expression ending in "."
+		// against doc, session, and corpus type facts. Also covers
+		// "f(...)." call receivers and argument-position synthesis
+		// (error sentinels, the file's own literals).
+		var memNames map[string]bool
+		if dis&fMem == 0 {
+			pstart := 0
+			if len(prefix) > 96<<10 {
+				pstart = len(prefix) - 96<<10
+				for pstart < len(prefix) && prefix[pstart] != '\n' {
+					pstart++
+				}
+			}
+			pf := extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
+			chain, call, isDot := dotChain(linePrefix)
+			var mems []string
+			corpOnly := false
+			if isDot {
+				if call != "" {
+					mems = callMembers(call, pf, e.sessFacts, e.callMem)
+				} else {
+					mems, corpOnly = membersFor(chain, pf, e.sessFacts, e.tyMem, e.callMem)
+				}
+				for _, m := range mems {
+					if ok := e.accept(m, ns, restN); ok && !seen[m] {
+						seen[m] = true
+						sc := w.Dyn * 2
+						if corpOnly {
+							sc = w.Dyn * 1.5
+						}
+						items = append(items, mk(m, "mem", sc))
+						if memNames == nil {
+							memNames = map[string]bool{}
+						}
+						memNames[strings.TrimSuffix(m, "(")] = true
+					}
+				}
+			}
+			var sessDecls map[string]bool
+			if e.sessFacts != nil {
+				sessDecls = e.sessFacts.decls
+			}
+			var docDecls map[string]bool
+			if pf != nil {
+				docDecls = pf.decls
+			}
+			for _, c := range argSynthesis(linePrefix, scope, sessDecls, docDecls, docLiterals(prefix, 8)) {
+				if ok := e.accept(c, ns, restN); ok && !seen[c] {
+					seen[c] = true
+					items = append(items, mk(c, "mem", w.Dyn*0.3))
+				}
+			}
+		}
+
+		// Plausibility filter: drop candidates that cannot sit at the
+		// cursor (prose leaks, brace doubling, tag fragments, type
+		// keywords in operand position).
+		kept := items[:0]
+		for _, it := range items {
+			if plausible(it.Text, linePrefix) {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
+
 		// Post-pass per item: learned-line boost and fill-in-the-middle
 		// verification.
 		for i := range items {
@@ -1555,6 +1639,21 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					// hit over a stronger candidate outright.
 					it.Score *= 1 + 0.12*math.Min(wsum, 3)
 					it.Source = it.Source + "+scope"
+				}
+			}
+			// A candidate that opens with a member the receiver's
+			// type actually has earns a lift on top of its retrieval
+			// score: the type fact says it exists.
+			if memNames != nil {
+				for _, t := range tokenize.LexLine([]byte(it.Text)) {
+					if strings.TrimSpace(t) == "" {
+						continue
+					}
+					if tokenize.IsIdentTok(t) && memNames[t] {
+						it.Score *= 1.5
+						it.Source = it.Source + "+mem"
+					}
+					break
 				}
 			}
 			// Per-source acceptance learning: sources that the caller
@@ -1650,6 +1749,12 @@ func dedupeShapes(items []Item, scope map[string]bool) []Item {
 	var out []Item
 	seenSh := map[string]map[string]bool{}
 	for _, it := range items {
+		// Member items are deliberately distinct offers: Get(, Put(,
+		// and List( share a masked shape but are not interchangeable.
+		if strings.HasPrefix(it.Source, "mem") {
+			out = append(out, it)
+			continue
+		}
 		// LexLine stops at the first newline, so key on the first two
 		// lines: a multi-line variant differs from its single-line
 		// sibling and deserves its own slot.
