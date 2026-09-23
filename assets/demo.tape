@@ -9,7 +9,8 @@ Set FontSize 22
 Set Width 1400
 Set Height 750
 Set Padding 20
-Set TypingSpeed 80ms
+Set TypingSpeed 45ms
+Set Framerate 30
 Set Theme "Catppuccin Mocha"
 
 Hide
@@ -18,25 +19,24 @@ Enter
 Type "nvim -u init.lua main.go"
 Enter
 Show
-Sleep 5s
+Sleep 6.5s
 
 # inside func main, blank line
 Type "5ji"
-Sleep 500ms
+Sleep 300ms
 Type "fmt.Pri"
-Sleep 3s
+Sleep 3.5s
 Tab
-Sleep 1s
+Sleep 600ms
 
 Escape
 Type "o"
 Type "for i :="
 Sleep 3s
 Tab
-Sleep 1s
+Sleep 1.5s
 
+Hide
 Escape
-Sleep 500ms
-Type ":wq"
+Type ":q!"
 Enter
-Sleep 1s
