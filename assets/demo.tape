@@ -9,8 +9,8 @@ Set FontSize 22
 Set Width 1400
 Set Height 750
 Set Padding 20
-Set TypingSpeed 40ms
-Set Framerate 30
+Set TypingSpeed 30ms
+Set Framerate 50
 Set Theme "Catppuccin Mocha"
 
 Hide
@@ -27,25 +27,25 @@ Sleep 400ms
 # beat 1: defer
 Type "i"
 Type "defer f."
-Sleep 1.1s
+Sleep 900ms
 Tab
-Sleep 500ms
+Sleep 350ms
 
 # beat 2: fmt call
 Escape
 Type "o"
 Type "fmt."
-Sleep 1.1s
+Sleep 900ms
 Tab
-Sleep 500ms
+Sleep 350ms
 
 # beat 3: loop with trailing multi-line ghost
 Escape
 Type "o"
 Type "for i :="
-Sleep 1.1s
+Sleep 900ms
 Tab
-Sleep 1.5s
+Sleep 1.2s
 
 Hide
 Escape
