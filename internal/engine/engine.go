@@ -97,6 +97,7 @@ type doc struct {
 	cache *model.Cache
 	lines []string // normalized nonblank lines, for the dynamic index
 	facts *facts   // member-memory extraction, merged into sessFacts
+	prev  string   // last built text: edit-rule diffs compare against it
 }
 
 // Engine is the live completion state: static model + line index plus
@@ -180,6 +181,14 @@ type Engine struct {
 	winShown int     // model-source items shown since last tune
 	winAcc   int     // model-source items accepted since last tune
 	w        Weights // scoring weights. Tuned offline by `q4tab tune`
+
+	// emu guards the edit-rule ring: rewrite rules extracted from
+	// didChange diffs drive propagation variants and the working-set
+	// boost at completion time. Leaf lock like shmu.
+	emu      sync.Mutex
+	edits    []editRule
+	ranker   *Ranker // online logistic reranker over shown/accept pairs
+	rankPath string
 
 	// users holds per-tenant overlays for hosted mode: each tenant gets
 	// a private cache + learned-line set so one server can learn each
@@ -402,10 +411,13 @@ func (e *Engine) InstallDelta(files []DeltaFile) {
 
 // SetJournal points the learned-completions journal at path and loads it.
 // Call after SetModel so learned tokens intern into the model vocab.
+// The ranker weights live beside the journal.
 func (e *Engine) SetJournal(path string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.journal = path
+	e.rankPath = path + ".rank"
+	e.ranker = LoadRanker(e.rankPath)
 	e.loadJournalLocked()
 }
 
@@ -554,13 +566,22 @@ func (e *Engine) recordAccept(uri, text string, line int) {
 				e.winAcc++
 			}
 			e.shmu.Unlock()
+			if e.ranker != nil {
+				e.ranker.update(it.feat, true)
+			}
 			e.journalEventLocked("a", it, i)
 		} else {
 			e.shmu.Lock()
 			e.rejN[baseSource(it.Source)]++
 			e.shmu.Unlock()
+			if e.ranker != nil {
+				e.ranker.update(it.feat, false)
+			}
 			e.journalEventLocked("r", it, i)
 		}
+	}
+	if e.ranker != nil {
+		e.ranker.saveIfDirty(e.rankPath)
 	}
 }
 
@@ -582,7 +603,13 @@ func (e *Engine) Reject(uri string, line int) {
 		return
 	}
 	for i, it := range se.items {
+		if e.ranker != nil {
+			e.ranker.update(it.feat, false)
+		}
 		e.journalEventLocked("r", it, i)
+	}
+	if e.ranker != nil {
+		e.ranker.saveIfDirty(e.rankPath)
 	}
 }
 
@@ -715,14 +742,15 @@ func (e *Engine) journalEventLocked(kind string, it Item, rank int) {
 		return
 	}
 	rec, _ := json.Marshal(struct {
-		E   string  `json:"e"`
-		Src string  `json:"s"`
-		Scr float64 `json:"v"`
-		R   int     `json:"r"`
-		L   int     `json:"l"`
-		M   bool    `json:"m"`
+		E   string    `json:"e"`
+		Src string    `json:"s"`
+		Scr float64   `json:"v"`
+		R   int       `json:"r"`
+		L   int       `json:"l"`
+		M   bool      `json:"m"`
+		F   []float32 `json:"f,omitempty"`
 	}{kind, baseSource(it.Source), it.Score, rank, len(it.Text),
-		strings.IndexByte(it.Text, '\n') >= 0})
+		strings.IndexByte(it.Text, '\n') >= 0, it.feat})
 	e.jmu.Lock()
 	defer e.jmu.Unlock()
 	if e.journalF == nil {
@@ -993,18 +1021,30 @@ func (e *Engine) drainOnce() bool {
 	}
 
 	// Install per-doc results under each doc's own lock. Docs updated
-	// since the snapshot are dropped.
+	// since the snapshot are dropped. The text diff between the last
+	// built version and this one yields edit rules for the session.
+	var newRules []editRule
 	var live []*built
 	for i := range bs {
 		b := &bs[i]
 		b.d.mu.Lock()
 		if b.d.gen == b.gen {
+			newRules = append(newRules, diffEdits(b.d.prev, b.text, 8)...)
+			b.d.prev = b.text
 			b.d.cache = b.cache
 			b.d.lines = b.lines
 			b.d.facts = b.facts
 			live = append(live, b)
 		}
 		b.d.mu.Unlock()
+	}
+	if len(newRules) > 0 {
+		e.emu.Lock()
+		e.edits = append(e.edits, newRules...)
+		if len(e.edits) > 256 {
+			e.edits = append([]editRule(nil), e.edits[len(e.edits)-256:]...)
+		}
+		e.emu.Unlock()
 	}
 
 	// e.mu section: shared counters and get-or-create of session/dir
@@ -1139,6 +1179,14 @@ type Item struct {
 	// already after the cursor on this line. Clients should replace to
 	// end-of-line rather than insert at the cursor.
 	ReplaceToEOL bool
+
+	// feat is the reranker feature vector, computed once in the
+	// post-pass and reused by the learned model and the journal.
+	// scopeHits/memHit/learnHit cache what the boost passes saw.
+	feat      []float32
+	scopeHits int
+	memHit    bool
+	learnHit  bool
 }
 
 // isIdentStart reports whether c can start an identifier (no digits).
@@ -1151,7 +1199,7 @@ func isIdentByte(c byte) bool {
 }
 
 // Feature flags for A/B debugging:
-// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem
+// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk
 const (
 	fAdapt = 1 << iota
 	fScope
@@ -1166,6 +1214,9 @@ const (
 	fSrc
 	fEmbed
 	fMem
+	fEdit
+	fRank
+	fBlk
 )
 
 func disabledFeatures() int {
@@ -1198,6 +1249,12 @@ func disabledFeatures() int {
 			d |= fEmbed
 		case "mem":
 			d |= fMem
+		case "edit":
+			d |= fEdit
+		case "rank":
+			d |= fRank
+		case "blk":
+			d |= fBlk
 		}
 	}
 	return d
@@ -1595,6 +1652,38 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			}
 		}
 
+		// Edit-history propagation: rewrite rules mined from
+		// didChange diffs. A candidate still using the old side of a
+		// recent edit gets a variant carrying the new side; one that
+		// already names a just-touched identifier earns a working-set
+		// boost. This is the next-edit signal: rename a field once and
+		// every stale-site suggestion follows.
+		if dis&fEdit == 0 {
+			e.emu.Lock()
+			rules := append([]editRule(nil), e.edits...)
+			e.emu.Unlock()
+			if len(rules) > 0 {
+				var vars []Item
+				for _, it := range items {
+					for _, r := range rules {
+						if nv, ok := r.apply(it.Text); ok && nv != it.Text && !seen[nv] && e.accept(nv, ns, restN) {
+							seen[nv] = true
+							vars = append(vars, mk(nv, it.Source+"+edit", it.Score*0.85))
+						}
+					}
+				}
+				items = append(items, vars...)
+				for i := range items {
+					for _, r := range rules {
+						if r.touches(items[i].Text) {
+							items[i].Score *= 1.12
+							break
+						}
+					}
+				}
+			}
+		}
+
 		// Plausibility filter: drop candidates that cannot sit at the
 		// cursor (prose leaks, brace doubling, tag fragments, type
 		// keywords in operand position).
@@ -1605,6 +1694,14 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			}
 		}
 		items = kept
+
+		// Nested-cache locality: the enclosing block is the likeliest
+		// place a pattern repeats. Candidates whose completed line
+		// already appears verbatim inside it get a lift.
+		var enclSet map[string]bool
+		if dis&fBlk == 0 {
+			enclSet = enclosingBlockLines(prefix)
+		}
 
 		// Post-pass per item: learned-line boost and fill-in-the-middle
 		// verification.
@@ -1640,6 +1737,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					it.Score *= 1 + 0.12*math.Min(wsum, 3)
 					it.Source = it.Source + "+scope"
 				}
+				it.scopeHits = hits
 			}
 			// A candidate that opens with a member the receiver's
 			// type actually has earns a lift on top of its retrieval
@@ -1652,6 +1750,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					if tokenize.IsIdentTok(t) && memNames[t] {
 						it.Score *= 1.5
 						it.Source = it.Source + "+mem"
+						it.memHit = true
 					}
 					break
 				}
@@ -1677,12 +1776,18 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			if n > 0 {
 				it.Score += float64(min(n, 10)) * w.Learn
 				it.Source = it.Source + "+learn"
+				it.learnHit = true
 			} else if e.learnIdx != nil && len(first) >= 4 &&
 				e.learnIdx.HasPrefix(lines.Normalize(linePrefix+first)) {
 				// The suggestion is a strict prefix of a line that was
 				// accepted before: weaker but still useful signal.
 				it.Score += w.Learn / 2
 				it.Source = it.Source + "+learn"
+				it.learnHit = true
+			}
+			if enclSet != nil && enclSet[lines.Normalize(linePrefix+first)] {
+				it.Score *= 1.2
+				it.Source = it.Source + "+blk"
 			}
 			// Fill-in-the-middle, two forms. Both turn a replace-to-EOL
 			// suggestion into a zero-width insert mid-line.
@@ -1728,6 +1833,18 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			items[i].Score *= e.cal.Boost(&items[i], i)
 		}
 	}
+	// Online reranker: the logistic model over per-candidate features
+	// applies last, trained live on this user's accepts and rejects.
+	if dis&fRank == 0 && e.ranker != nil {
+		atDot := strings.HasSuffix(strings.TrimRight(linePrefix, " \t"), ".")
+		tp := strings.TrimRight(linePrefix, " \t")
+		argPos := strings.HasSuffix(tp, "(") || strings.HasSuffix(tp, ",")
+		for i := range items {
+			it := &items[i]
+			it.feat = itemFeat(it, it.scopeHits, it.memHit, thin, atDot, argPos, it.learnHit)
+			it.Score *= e.ranker.mult(it.feat)
+		}
+	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
 	if dis&fMMR == 0 {
 		items = dedupeShapes(items, scope)
@@ -1751,7 +1868,9 @@ func dedupeShapes(items []Item, scope map[string]bool) []Item {
 	for _, it := range items {
 		// Member items are deliberately distinct offers: Get(, Put(,
 		// and List( share a masked shape but are not interchangeable.
-		if strings.HasPrefix(it.Source, "mem") {
+		// Edit-propagation variants likewise differ from their stale
+		// sibling in exactly the identifier the user just renamed.
+		if strings.HasPrefix(it.Source, "mem") || strings.Contains(it.Source, "+edit") {
 			out = append(out, it)
 			continue
 		}
@@ -1938,6 +2057,47 @@ func (e *Engine) accept(sug, ns, restN string) bool {
 		return !strings.Contains(ng, restN)
 	}
 	return !strings.HasSuffix(ng, restN)
+}
+
+// enclosingBlockLines returns the normalized line set of the block
+// enclosing the cursor: everything from the nearest unmatched "{"
+// back-scanning through the prefix. Nested-scope locality means a
+// line already written inside this block is a strong repeat
+// candidate. Bounded: the scan caps at 256KB and 2000 lines.
+func enclosingBlockLines(prefix string) map[string]bool {
+	const maxScan = 256 << 10
+	if len(prefix) > maxScan {
+		prefix = prefix[len(prefix)-maxScan:]
+	}
+	depth := 0
+	start := -1
+	for i := len(prefix) - 1; i >= 0; i-- {
+		switch prefix[i] {
+		case '}':
+			depth++
+		case '{':
+			if depth == 0 {
+				start = i
+				i = -1
+			} else {
+				depth--
+			}
+		}
+	}
+	if start < 0 {
+		return nil
+	}
+	set := map[string]bool{}
+	n := 0
+	for _, l := range strings.Split(prefix[start:], "\n") {
+		if nl := lines.Normalize(l); len(nl) > 3 {
+			set[nl] = true
+			if n++; n > 2000 {
+				break
+			}
+		}
+	}
+	return set
 }
 
 // fileLines scans text for lines matching the prefix and returns their

@@ -421,3 +421,95 @@ u.`)))
 		t.Fatal("no members for annotated u")
 	}
 }
+
+func TestDiffEditsRename(t *testing.T) {
+	old := "package x\n\nfunc f() {\n\ts.items[id] = it\n\t_ = s.items\n}"
+	new := "package x\n\nfunc f() {\n\ts.jobs[id] = it\n\t_ = s.jobs\n}"
+	rules := diffEdits(old, new, 8)
+	found := false
+	for _, r := range rules {
+		if r.fromS == "items" && r.toS == "jobs" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected items->jobs rule, got %+v", rules)
+	}
+	// apply splices at token boundaries only
+	r := editRule{from: []string{"items"}, to: []string{"jobs"}, fromS: "items", toS: "jobs"}
+	if nv, ok := r.apply("s.items[id] = it"); !ok || nv != "s.jobs[id] = it" {
+		t.Fatalf("apply: %q %v", nv, ok)
+	}
+	if _, ok := r.apply("s.itemsX = 1"); ok {
+		t.Fatal("must not rewrite inside a larger identifier")
+	}
+	if _, ok := r.apply("no match here"); ok {
+		t.Fatal("absent window must not apply")
+	}
+}
+
+func TestEnclosingBlockLines(t *testing.T) {
+	doc := "package x\n\nfunc a() {\n\tx := 1\n}\n\nfunc b() {\n\ty := 2\n\tz := "
+	set := enclosingBlockLines(doc)
+	if set == nil {
+		t.Fatal("no block found")
+	}
+	if !set["y := 2"] && !set["\ty := 2"] {
+		t.Fatalf("enclosing block missing its lines: %v", set)
+	}
+	joined := ""
+	for k := range set {
+		joined += k + "|"
+	}
+	if !strings.Contains(joined, "y := 2") {
+		t.Fatal("block should contain b's body")
+	}
+	if strings.Contains(joined, "x := 1") {
+		t.Fatal("block should not contain a's body")
+	}
+}
+
+func TestRankerLearns(t *testing.T) {
+	r := NewRanker()
+	it := Item{Text: "x := f()", Source: "file", Score: 10}
+	feat := itemFeat(&it, 2, false, false, false, false, false)
+	before := r.mult(feat)
+	for i := 0; i < 400; i++ {
+		r.update(feat, true)
+	}
+	after := r.mult(feat)
+	if after <= before {
+		t.Fatalf("accepts should raise the multiplier: %v -> %v", before, after)
+	}
+	for i := 0; i < 400; i++ {
+		r.update(feat, false)
+	}
+	if r.mult(feat) >= after {
+		t.Fatal("rejects should lower the multiplier")
+	}
+}
+
+func TestEditPropagationEndToEnd(t *testing.T) {
+	e := New(DefaultConfig())
+	// User just renamed items -> jobs; a stale call site now suggests
+	// the new name even though the file text still says items.
+	e.emu.Lock()
+	e.edits = append(e.edits, editRule{
+		from: []string{"items"}, to: []string{"jobs"},
+		fromS: "items", toS: "jobs",
+	})
+	e.emu.Unlock()
+	// Cursor sits after "s.": file repeats offer "items[...]" and the
+	// rule rewrites them to "jobs".
+	doc := "package x\n\nfunc f(s *Store) {\n\t_ = s.items[\"a\"]\n\t_ = s.items[\"b\"]\n\t_ = s."
+	got := e.Complete("file:///x.go", doc, len(doc))
+	var saw bool
+	for _, it := range got {
+		if strings.Contains(it.Text, "jobs") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("no jobs variant propagated; items=%v", got)
+	}
+}
