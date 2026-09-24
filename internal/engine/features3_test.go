@@ -181,6 +181,10 @@ func TestPlausibleFilters(t *testing.T) {
 		{"member stmt junk", "N; i < b", "s.st.", false},
 		{"member chain ok", "Get().String()", "s.st.", true},
 		{"member brace junk", "N {", "s.st.", false},
+		{"midtoken decl junk", "a i := 0", "x := lis", false},
+		{"midtoken keyword ok", "urn nil", "ret", true},
+		{"midtoken member ok", "rror()", "s.er", true},
+		{"midtoken assign ok", "tener = f()", "lis", true},
 	}
 	for _, c := range cases {
 		if got := plausible(c.cand, c.line, "go"); got != c.want {

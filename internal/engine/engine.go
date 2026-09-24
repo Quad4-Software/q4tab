@@ -1528,7 +1528,10 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 				if e.m != nil && e.idents != nil {
 					ids, fr := e.idents.Prefix(strings.ToLower(frag), 6)
 					for i, id := range ids {
-						if name := e.m.Vocab.Str(uint32(id)); name != "" {
+						// Vocab tokens carry leading space; the
+						// identifier itself is what must match the
+						// fragment.
+						if name := strings.TrimLeft(e.m.Vocab.Str(uint32(id)), " "); name != "" {
 							push(name, w.Dyn*0.5+float64(fr[i])*0.01)
 						}
 					}

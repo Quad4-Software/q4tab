@@ -117,6 +117,22 @@ func foreignLine(cand, lang string) bool {
 // cursor. linePrefix is the text on the current line before it; lang
 // scopes the cross-language veto.
 func plausible(cand, linePrefix, lang string) bool {
+	// Mid-token cursor: a candidate extending the fragment may not
+	// land a second bare identifier right after it. lis + "a i := 0"
+	// produces the invalid "lisa i"; urn + " nil" produces the legal
+	// "return nil" because the completed token is a keyword. Inside a
+	// string literal the fragment is content, not code.
+	if frag := trailingIdent(linePrefix); frag != "" && !inString(linePrefix) &&
+		len(cand) > 0 && isIdentStart(cand[0]) {
+		j := 0
+		for j < len(cand) && isIdentByte(cand[j]) {
+			j++
+		}
+		if !tokenize.IsKeywordish(frag+cand[:j]) &&
+			j+1 < len(cand) && cand[j] == ' ' && isIdentByte(cand[j+1]) {
+			return false
+		}
+	}
 	c, ci := firstNonWS(cand)
 	if ci < 0 {
 		return false
@@ -430,4 +446,27 @@ func trailingIdent(linePrefix string) string {
 		i--
 	}
 	return linePrefix[i:]
+}
+
+// inString reports whether the cursor sits inside a quoted literal:
+// an unclosed quote on the line toggles string state.
+func inString(linePrefix string) bool {
+	open := byte(0)
+	for i := 0; i < len(linePrefix); i++ {
+		c := linePrefix[i]
+		if open == 0 {
+			if c == '"' || c == '\'' || c == '`' {
+				open = c
+			}
+			continue
+		}
+		if c == '\\' && open != '`' {
+			i++
+			continue
+		}
+		if c == open {
+			open = 0
+		}
+	}
+	return open != 0
 }
