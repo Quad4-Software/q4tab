@@ -16,6 +16,7 @@ in-scope identifiers).
 | `lineBi` | line n-gram hit |
 | `model` | n-gram chain decode |
 | `mem` | member memory: resolved receiver members, arg synthesis |
+| `edit` | edit-rule variant: candidate rewritten to a name the user just changed to |
 | `fim` / `fimIdx` | verified fill-in-the-middle |
 | `scope` | in-scope identifier reuse boost |
 | `struct` / `lang` | structural and per-language table votes |
@@ -56,6 +57,23 @@ Final candidates are deduplicated on masked two-line shape, so the
 list is not four variants of the same line. A variant survives if it
 introduces an identifier that exists in the current scope.
 
+## Block locality
+
+The enclosing brace block is the likeliest place a pattern repeats.
+A candidate whose completed line already appears verbatim inside it
+earns a boost. This is the nested-scope locality result from cache
+language model research applied to the open document.
+
+## Online reranker
+
+A logistic model over per-candidate features (source class, score,
+scope hits, member hit, multi-line, context shape) trains by SGD on
+every accept and its shown-but-skipped siblings. It applies a bounded
+multiplier after all other scoring: a cold model is a no-op and a
+trained one reorders but cannot veto. Weights persist beside the
+journal and feature vectors land in journal events for offline
+analysis.
+
 ## Learning from accepts
 
 Accepts are journaled to `learned.jsonl`, replayed on startup, mixed
@@ -69,5 +87,5 @@ relocates the journal.
 Every feature can be disabled individually for debugging:
 
 ```sh
-Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem q4tab serve
+Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk q4tab serve
 ```
