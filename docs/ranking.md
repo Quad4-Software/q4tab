@@ -16,6 +16,7 @@ in-scope identifiers).
 | `lineBi` | line n-gram hit |
 | `model` | n-gram chain decode |
 | `mem` | member memory: resolved receiver members, arg synthesis |
+| `ident` | mid-token identifier continuation: the cursor sits inside a name and the candidate completes it from scope or the corpus vocabulary |
 | `edit` | edit-rule variant: candidate rewritten to a name the user just changed to |
 | `fim` / `fimIdx` | verified fill-in-the-middle |
 | `scope` | in-scope identifier reuse boost |
@@ -24,11 +25,15 @@ in-scope identifiers).
 ## Plausibility filter
 
 Before ranking, candidates that cannot sit at the cursor are dropped:
-anything not starting with a member name after a `.`, an opening
-brace right after one, prose fragments that leaked into the line
-index (a capitalized word followed by a lowercase word), and
-declaration material like scalar type keywords or struct tags in
-operand position.
+anything not starting with a member name after a `.`, statement
+separators or block braces inside a member continuation, a lone
+opening brace inside a multi-line suggestion, prose fragments that
+leaked into the line index (a capitalized word followed by a
+lowercase word), declaration material like scalar type keywords or
+struct tags in operand position, and unambiguous foreign-language
+markers (a Go-style `:=` inside Python, `self.` inside Go, and so
+on). Session and learned lines are additionally separated per
+language at index time so bleed cannot reach the candidate list.
 
 ## Scope boost
 
@@ -87,5 +92,5 @@ relocates the journal.
 Every feature can be disabled individually for debugging:
 
 ```sh
-Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk q4tab serve
+Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk,snip,gate q4tab serve
 ```

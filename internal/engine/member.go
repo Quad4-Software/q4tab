@@ -885,6 +885,39 @@ func callMembers(name string, doc, sess *facts, tyMem, callM map[string][]string
 	return out
 }
 
+// argElemType resolves the element type of the container expression
+// at append(coll,: a bare var goes through the elem table, a dotted
+// chain through recv and field types (container fields store their
+// element type already).
+func argElemType(argExpr string, doc, sess *facts) string {
+	argExpr = strings.TrimSpace(argExpr)
+	if argExpr == "" {
+		return ""
+	}
+	if i := strings.IndexByte(argExpr, '.'); i > 0 {
+		parts := strings.Split(argExpr, ".")
+		typ := lookupRecv(strings.TrimSpace(parts[0]), doc, sess)
+		for _, link := range parts[1:] {
+			if typ == "" {
+				return ""
+			}
+			nt := ""
+			for _, f := range []*facts{doc, sess} {
+				if f != nil && f.tyFld[typ] != nil && f.tyFld[typ][strings.TrimSpace(link)] != "" {
+					nt = f.tyFld[typ][strings.TrimSpace(link)]
+					break
+				}
+			}
+			typ = nt
+		}
+		return typ
+	}
+	if t := lookupElem(argExpr, doc, sess); t != "" {
+		return t
+	}
+	return ""
+}
+
 func lookupRecv(name string, doc, sess *facts) string {
 	if doc != nil {
 		if t := doc.recv[name]; t != "" {

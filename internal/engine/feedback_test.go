@@ -132,8 +132,10 @@ func TestDirOfURIEdgeCases(t *testing.T) {
 func waitDyn(t *testing.T, e *Engine, prefix string) {
 	t.Helper()
 	for i := 0; i < 200; i++ {
-		if di := e.dynIndex(); di != nil && di.HasPrefix(prefix) {
-			return
+		for _, di := range e.dynFor("go") {
+			if di != nil && di.HasPrefix(prefix) {
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -260,20 +260,23 @@ func plausible(cand, linePrefix, lang string) bool {
 }
 
 // argSynthesis produces fallback candidates for argument position:
-// scoped error sentinels inside errors.Is/As-style calls, and string
-// literals already present in the document for calls that take one.
-// Both fire only in call-arg position (line ends with "(" or ",").
-func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool, lits []string) []string {
+// scoped error sentinels inside errors.Is/As-style calls, element-typed
+// vars for append(coll, and string literals already present in the
+// document for calls that take one. All fire only in call-arg position
+// (line ends with "(" or ",").
+func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool, lits []string, pf, sf *facts) []string {
 	last := exprTail(linePrefix)
 	if last != '(' && last != ',' {
 		return nil
 	}
 	var out []string
 
-	// Find the call head: the ident before the enclosing "(".
+	// Find the call head: the ident before the enclosing "(", plus the
+	// text of the first argument when the cursor sits at the second.
 	toks := tokenize.LexLine([]byte(strings.TrimRight(linePrefix, " \t")))
 	head := ""
 	depth := 0
+	parenAt := -1
 	for i := len(toks) - 1; i >= 0; i-- {
 		t := toks[i]
 		switch t {
@@ -281,6 +284,7 @@ func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool,
 			depth++
 		case "(":
 			if depth == 0 {
+				parenAt = i
 				j := i - 1
 				for j >= 0 && strings.TrimSpace(toks[j]) == "" {
 					j--
@@ -293,6 +297,19 @@ func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool,
 				depth--
 			}
 		}
+	}
+	var firstArg string
+	if parenAt >= 0 && last == ',' {
+		var b strings.Builder
+		for _, t := range toks[parenAt+1:] {
+			if t == "," {
+				break
+			}
+			if strings.TrimSpace(t) != "" {
+				b.WriteString(t)
+			}
+		}
+		firstArg = b.String()
 	}
 
 	// errors.Is(err, / errors.As(err, / a.Equal( style predicates
@@ -319,6 +336,38 @@ func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool,
 						n++
 					}
 					if n >= 3 {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// append(coll, wants an element of coll's type: a scoped var of
+	// that element type is the likeliest second argument.
+	if head == "append" && firstArg != "" {
+		if elemT := argElemType(firstArg, pf, sf); elemT != "" {
+			n := 0
+			for _, f := range []*facts{pf, sf} {
+				if f == nil {
+					continue
+				}
+				for v, t := range f.recv {
+					if t != elemT || v == firstArg {
+						continue
+					}
+					c := " " + v + ")"
+					dup := false
+					for _, o := range out {
+						if o == c {
+							dup = true
+						}
+					}
+					if !dup {
+						out = append(out, c)
+						n++
+					}
+					if n >= 2 {
 						break
 					}
 				}
@@ -371,4 +420,14 @@ func docLiterals(prefix string, limit int) []string {
 		}
 	}
 	return out
+}
+
+// trailingIdent returns the identifier fragment ending the line
+// prefix: the partial word the cursor sits inside.
+func trailingIdent(linePrefix string) string {
+	i := len(linePrefix)
+	for i > 0 && isIdentByte(linePrefix[i-1]) {
+		i--
+	}
+	return linePrefix[i:]
 }

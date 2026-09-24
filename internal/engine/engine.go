@@ -100,6 +100,7 @@ type doc struct {
 	blocks map[string][]string // normalized line -> next nonblank lines
 	prev   string              // last built text: edit-rule diffs compare against it
 	at     time.Time           // last UpdateDoc: freshest doc weighs most in dyn
+	lang   string              // LangOf(uri): session lines index per language
 }
 
 // Engine is the live completion state: static model + line index plus
@@ -111,33 +112,34 @@ type doc struct {
 // carry their own internal locks, so they are safe to touch under the
 // engine's read lock. recordShown runs under Lock at the end.
 type Engine struct {
-	cfg        Config
-	m          *model.Model
-	li         *lines.Index
-	eofID      uint32
-	nlID       uint32
-	mu         sync.RWMutex
-	docs       sync.Map // uri -> *doc. Never under e.mu so didOpen is not a writer
-	docsN      atomic.Int64
-	dirs       map[string]*model.Cache // per-directory caches: sibling-file idioms
-	dirTok     map[string]int
-	session    *model.Cache
-	sessTok    int
-	learned    *model.Cache
-	learnTok   int            // tokens fed to the learned cache since last reset
-	learnLines []string       // normalized accepted lines, merged into dyn index
-	learnSet   map[string]int // completed line -> times accepted
-	learnIdx   *lines.Index   // sorted learnLines for prefix lookups
-	pendLearn  []string       // learned texts seen before the model loaded
-	journal    string
-	journalF   *os.File // lazily opened append handle for the journal
-	learnN     int
-	vocabCap   int                         // interning stops growing the vocab past this
-	delta      *model.Cache                // incremental-index overlay: new/changed files
-	deltaLines []string                    // delta file lines, merged into dyn index
-	deltaFiles int                         // files in the current delta overlay
-	deltaTok   int                         // tokens fed into the delta cache
-	dyn        atomic.Pointer[lines.Index] // rebuilt lazily from open docs + learned
+	cfg         Config
+	m           *model.Model
+	li          *lines.Index
+	eofID       uint32
+	nlID        uint32
+	mu          sync.RWMutex
+	docs        sync.Map // uri -> *doc. Never under e.mu so didOpen is not a writer
+	docsN       atomic.Int64
+	dirs        map[string]*model.Cache // per-directory caches: sibling-file idioms
+	dirTok      map[string]int
+	session     *model.Cache
+	sessTok     int
+	learned     *model.Cache
+	learnTok    int                 // tokens fed to the learned cache since last reset
+	learnLines  []string            // normalized accepted lines, for learnSet/learnIdx
+	learnByLang map[string][]string // accepted lines bucketed by accepting file's lang
+	learnSet    map[string]int      // completed line -> times accepted
+	learnIdx    *lines.Index        // sorted learnLines for prefix lookups
+	pendLearn   []string            // learned texts seen before the model loaded
+	journal     string
+	journalF    *os.File // lazily opened append handle for the journal
+	learnN      int
+	vocabCap    int                                     // interning stops growing the vocab past this
+	delta       *model.Cache                            // incremental-index overlay: new/changed files
+	deltaByLang map[string][]string                     // delta file lines by language
+	deltaFiles  int                                     // files in the current delta overlay
+	deltaTok    int                                     // tokens fed into the delta cache
+	dyn         atomic.Pointer[map[string]*lines.Index] // per-language session indexes
 	// Builder queue state, all under dmu: pend maps uri -> queued doc
 	// task, dynDirt marks a pending dyn rebuild, building marks a live
 	// buildWorker. Kept off e.mu so didOpen bursts never starve
@@ -234,6 +236,8 @@ func New(cfg Config) *Engine {
 		minProb:  cfg.MinProb,
 		w:        DefaultWeights(),
 		maxUsrs:  512,
+
+		learnByLang: map[string][]string{},
 	}
 }
 
@@ -387,7 +391,7 @@ func (e *Engine) InstallDelta(files []DeltaFile) {
 	// An empty delta still clears the old overlay: a full rebuild may
 	// have folded the changes into the base model.
 	e.delta = model.NewCache(e.cfg.CacheOrdr)
-	e.deltaLines = e.deltaLines[:0]
+	e.deltaByLang = map[string][]string{}
 	e.deltaFiles = 0
 	e.deltaTok = 0
 	for _, f := range files {
@@ -398,7 +402,8 @@ func (e *Engine) InstallDelta(files []DeltaFile) {
 		e.delta.Add(ids, e.eofID)
 		e.deltaTok += len(ids)
 		e.deltaFiles++
-		e.deltaLines = append(e.deltaLines, docLines(string(f.Data))...)
+		lg := LangOf(f.Path)
+		e.deltaByLang[lg] = append(e.deltaByLang[lg], docLines(string(f.Data))...)
 		if e.syms != nil {
 			e.syms.RemovePath(f.Path)
 			for _, s := range symbols.Extract(f.Path, f.Data) {
@@ -448,6 +453,7 @@ func (e *Engine) loadJournalLocked() {
 			Text string `json:"t"`
 			Ev   string `json:"e"`
 			Src  string `json:"s"`
+			Lang string `json:"g"`
 		}
 		if json.Unmarshal(line, &rec) != nil {
 			continue
@@ -482,6 +488,7 @@ func (e *Engine) loadJournalLocked() {
 		}
 		for _, l := range docLines(rec.Text) {
 			e.learnLines = append(e.learnLines, l)
+			e.learnByLang[rec.Lang] = append(e.learnByLang[rec.Lang], l)
 			e.learnSet[l]++
 		}
 		e.learnN++
@@ -497,6 +504,11 @@ func (e *Engine) loadJournalLocked() {
 func (e *Engine) trimLearnedLocked() {
 	if len(e.learnLines) > 8192 {
 		e.learnLines = e.learnLines[len(e.learnLines)-8192:]
+	}
+	for lg, ls := range e.learnByLang {
+		if len(ls) > 8192 {
+			e.learnByLang[lg] = ls[len(ls)-8192:]
+		}
 	}
 	if len(e.learnSet) > 16384 {
 		// Rebuild from the surviving window rather than evicting
@@ -721,8 +733,10 @@ func (e *Engine) LearnFor(user, uri, text string, line int) {
 		e.pendLearn = append(e.pendLearn, text)
 	}
 	e.learnN++
+	lg := LangOf(uri)
 	for _, l := range docLines(text) {
 		e.learnLines = append(e.learnLines, l)
+		e.learnByLang[lg] = append(e.learnByLang[lg], l)
 		e.learnSet[l]++
 	}
 	e.trimLearnedLocked()
@@ -733,7 +747,8 @@ func (e *Engine) LearnFor(user, uri, text string, line int) {
 	if e.journal != "" {
 		rec, _ := json.Marshal(struct {
 			Text string `json:"t"`
-		}{text})
+			Lang string `json:"g,omitempty"`
+		}{text, lg})
 		// Keep an append handle open rather than open/write/close per
 		// accepted completion. jmu serializes with journalEventLocked.
 		e.jmu.Lock()
@@ -821,7 +836,8 @@ func (e *Engine) LookupLines(prefix string, limit int) []string {
 	defer e.mu.RUnlock()
 	seen := map[string]bool{}
 	var out []string
-	for _, idx := range []*lines.Index{e.dynIndex(), e.li} {
+	idxs := append(e.dynFor(""), e.li)
+	for _, idx := range idxs {
 		if idx == nil {
 			continue
 		}
@@ -913,6 +929,7 @@ func (e *Engine) UpdateDoc(uri, text string) {
 	d.mu.Lock()
 	d.gen++
 	d.at = time.Now()
+	d.lang = LangOf(uri)
 	t := docTask{uri: uri, d: d, gen: d.gen}
 	if len(text) > e.cfg.MaxDocSize {
 		d.cache = nil
@@ -1104,17 +1121,19 @@ func (e *Engine) drainOnce() bool {
 		}
 	}
 	// Snapshot for the dynamic index rebuild: docs map is lock-free,
-	// learnLines/deltaLines need e.mu. Member facts merge here too so
-	// "s.st." can see the methods a sibling doc declares.
-	var src [][]string
+	// learnByLang/deltaByLang need e.mu. Member facts merge here too so
+	// "s.st." can see the methods a sibling doc declares. Lines index
+	// per language so a Python doc never sees Go session lines.
+	var srcByLang map[string][][]string
 	if rebuild {
+		srcByLang = map[string][][]string{}
 		sf := newFacts()
 		sb := map[string][]string{}
 		e.docs.Range(func(_, v any) bool {
 			d := v.(*doc)
 			d.mu.Lock()
 			if len(d.lines) > 0 {
-				src = append(src, d.lines)
+				srcByLang[d.lang] = append(srcByLang[d.lang], d.lines)
 			}
 			if d.facts != nil {
 				sf.merge(d.facts)
@@ -1129,7 +1148,12 @@ func (e *Engine) drainOnce() bool {
 		})
 		e.sessFacts = sf
 		e.sessBlocks = sb
-		src = append(src, e.learnLines, e.deltaLines)
+		for lg, ls := range e.learnByLang {
+			srcByLang[lg] = append(srcByLang[lg], ls)
+		}
+		for lg, ls := range e.deltaByLang {
+			srcByLang[lg] = append(srcByLang[lg], ls)
+		}
 		// The doc being edited right now is the most likely source of
 		// what repeats next: its lines count double in the dyn index.
 		var lastURI string
@@ -1149,7 +1173,7 @@ func (e *Engine) drainOnce() bool {
 				d := dv.(*doc)
 				d.mu.Lock()
 				if len(d.lines) > 0 {
-					src = append(src, d.lines)
+					srcByLang[d.lang] = append(srcByLang[d.lang], d.lines)
 				}
 				d.mu.Unlock()
 			}
@@ -1162,13 +1186,18 @@ func (e *Engine) drainOnce() bool {
 	}
 
 	if rebuild {
-		b := lines.NewBuilder()
-		for _, ls := range src {
-			for _, l := range ls {
-				b.AddLine(l)
+		// One compact index per language, plus "" for unknown docs.
+		idx := map[string]*lines.Index{}
+		for lg, sets := range srcByLang {
+			b := lines.NewBuilder()
+			for _, ls := range sets {
+				for _, l := range ls {
+					b.AddLine(l)
+				}
 			}
+			idx[lg] = b.Compact()
 		}
-		e.dyn.Store(b.Compact())
+		e.dyn.Store(&idx)
 	}
 	return true
 }
@@ -1220,11 +1249,27 @@ func (e *Engine) internToks(toks []string) []uint32 {
 	return ids
 }
 
-// dynIndex returns the dynamic line overlay. Rebuilds happen in the
-// background worker, so the index may lag the latest edit by one build
-// cycle. That is fine for a hint layer.
-func (e *Engine) dynIndex() *lines.Index {
-	return e.dyn.Load()
+// dynFor returns the dynamic line indexes visible to a document of
+// the given language: its own bucket plus the unlanguaged one. The
+// corpus-wide index is lang-agnostic by design (counts make bleed
+// mostly self-limiting); the session layer is small enough that bleed
+// there was constant, so it is split.
+func (e *Engine) dynFor(lang string) []*lines.Index {
+	m := e.dyn.Load()
+	if m == nil {
+		return nil
+	}
+	out := []*lines.Index{(*m)[lang]}
+	// "" and "other" are the unlanguaged catch-alls (no extension,
+	// unknown type): always included.
+	for _, k := range []string{"", "other"} {
+		if k != lang {
+			if u := (*m)[k]; u != nil {
+				out = append(out, u)
+			}
+		}
+	}
+	return out
 }
 
 // Item is one completion candidate.
@@ -1452,6 +1497,55 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 
 		verbatimHit := false
 		localHit := false // same-file or session repeat: strongest precision
+
+		// Mid-token completion: the cursor ends inside an identifier
+		// fragment, so the likeliest continuation is the rest of a
+		// name already in scope or known to the corpus vocabulary.
+		// Skipped at dot position: member memory owns that slot.
+		if !strings.HasSuffix(strings.TrimRight(linePrefix, " \t"), ".") {
+			if frag := trailingIdent(linePrefix); len(frag) >= 1 {
+				type cand struct {
+					suf string
+					sc  float64
+				}
+				var idc []cand
+				seenId := map[string]bool{}
+				push := func(id string, sc float64) {
+					if len(id) <= len(frag) || !strings.HasPrefix(id, frag) || seenId[id] {
+						return
+					}
+					seenId[id] = true
+					idc = append(idc, cand{id[len(frag):], sc})
+				}
+				for id, n := range freq {
+					if n > 0 {
+						push(id, w.Dyn+float64(n))
+					}
+				}
+				for id := range dirScope {
+					push(id, w.Dyn*0.7)
+				}
+				if e.m != nil && e.idents != nil {
+					ids, fr := e.idents.Prefix(strings.ToLower(frag), 6)
+					for i, id := range ids {
+						if name := e.m.Vocab.Str(uint32(id)); name != "" {
+							push(name, w.Dyn*0.5+float64(fr[i])*0.01)
+						}
+					}
+				}
+				sort.Slice(idc, func(i, j int) bool { return idc[i].sc > idc[j].sc })
+				for i, c := range idc {
+					if i >= 4 {
+						break
+					}
+					if ok := e.accept(c.suf, ns, restN); ok && !seen[c.suf] {
+						seen[c.suf] = true
+						items = append(items, mk(c.suf, "ident", c.sc))
+					}
+				}
+			}
+		}
+
 		if len(text) <= e.cfg.MaxDocSize {
 			for _, c := range fileLines(text, linePrefix, exclude, curLineIdx, 3) {
 				if ok := e.accept(c, ns, restN); ok && !seen[c] {
@@ -1488,27 +1582,32 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 
 		// Dynamic overlay: lines from other open documents and learned
-		// completions. Each hit also checks the session block map for
-		// attested follower lines so a repeated two-or-three-line chunk
-		// surfaces whole.
-		if di := e.dynIndex(); di != nil {
+		// completions, indexed per language. Each hit also checks the
+		// session block map for attested follower lines so a repeated
+		// two-or-three-line chunk surfaces whole.
+		{
 			norm := lines.Normalize(linePrefix)
 			indent := leadingWS(linePrefix)
 			snips := 0
-			for _, c := range di.Complete(linePrefix, e.cfg.MaxItems*2, 4096) {
-				if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
-					seen[c.Text] = true
-					verbatimHit = true
-					localHit = true
-					items = append(items, mk(c.Text, "file", w.Dyn+float64(c.Count)))
+			for _, di := range e.dynFor(lang) {
+				if di == nil {
+					continue
 				}
-				if dis&fSnip == 0 && snips < 2 && len(e.sessBlocks) > 0 {
-					if fol := e.sessBlocks[norm+c.Text]; len(fol) > 0 {
-						full := c.Text + "\n" + indent + strings.Join(fol, "\n"+indent)
-						if ok := e.accept(full, ns, restN); ok && !seen[full] {
-							seen[full] = true
-							items = append(items, mk(full, "file+blk", w.Dyn*0.8+float64(c.Count)))
-							snips++
+				for _, c := range di.Complete(linePrefix, e.cfg.MaxItems*2, 4096) {
+					if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
+						seen[c.Text] = true
+						verbatimHit = true
+						localHit = true
+						items = append(items, mk(c.Text, "file", w.Dyn+float64(c.Count)))
+					}
+					if dis&fSnip == 0 && snips < 2 && len(e.sessBlocks) > 0 {
+						if fol := e.sessBlocks[norm+c.Text]; len(fol) > 0 {
+							full := c.Text + "\n" + indent + strings.Join(fol, "\n"+indent)
+							if ok := e.accept(full, ns, restN); ok && !seen[full] {
+								seen[full] = true
+								items = append(items, mk(full, "file+blk", w.Dyn*0.8+float64(c.Count)))
+								snips++
+							}
 						}
 					}
 				}
@@ -1746,10 +1845,17 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			if pf != nil {
 				docDecls = pf.decls
 			}
-			for _, c := range argSynthesis(linePrefix, scope, sessDecls, docDecls, docLiterals(prefix, 8)) {
+			for _, c := range argSynthesis(linePrefix, scope, sessDecls, docDecls, docLiterals(prefix, 8), pf, e.sessFacts) {
 				if ok := e.accept(c, ns, restN); ok && !seen[c] {
 					seen[c] = true
-					items = append(items, mk(c, "mem", w.Dyn*0.3))
+					// Declared names are the user's own: they deserve
+					// member-level weight over corpus-frequent
+					// alternatives.
+					sc := w.Dyn * 1.6
+					if strings.IndexByte(c, '"') >= 0 {
+						sc = w.Dyn * 0.5 // literal fallbacks rank softer
+					}
+					items = append(items, mk(c, "mem", sc))
 				}
 			}
 		}
@@ -1940,8 +2046,11 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 				if len(joined) >= 4 {
 					verified := e.li != nil && e.li.HasPrefix(joined)
 					if !verified {
-						if di := e.dynIndex(); di != nil {
-							verified = di.HasPrefix(joined)
+						for _, di := range e.dynFor(lang) {
+							if di != nil && di.HasPrefix(joined) {
+								verified = true
+								break
+							}
 						}
 					}
 					if verified {

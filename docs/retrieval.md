@@ -13,7 +13,12 @@ distance so far-away duplicates lose to near ones.
 
 Open documents, accepted completions from the journal, and the
 incremental delta. This is the session memory: what you accepted ten
-minutes ago is retrievable now.
+minutes ago is retrievable now. Lines are indexed per language
+(LangOf of the document URI or file path) so a Python buffer never
+sees Go session lines; unlanguaged entries share a catch-all bucket
+visible to every language. The most recently edited document weighs
+double, since the file being edited is the most likely source of the
+next repetition.
 
 ## Corpus line index
 
