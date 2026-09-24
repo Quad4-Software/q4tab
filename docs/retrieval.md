@@ -88,9 +88,9 @@ that begin with a member name.
 
 Every document update is diffed against its previous version and the
 token-level changes become rewrite rules for the session. Rename a
-field from `items` to `jobs` once and two things happen: candidates
-still using `items` gain a `jobs` variant, and candidates already
-using `jobs` get a small working-set boost. Rules are capped in size
+field from items to jobs once and two things happen: candidates
+still using items gain a jobs variant, and candidates already
+using jobs get a small working-set boost. Rules are capped in size
 and apply only at token boundaries, so they never corrupt unrelated
 text.
 

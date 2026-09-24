@@ -42,14 +42,92 @@ func exprTail(linePrefix string) byte {
 	return t[len(t)-1]
 }
 
+// langNever lists whole-token markers that cannot appear in the
+// given language's code. The corpus is multi-language and retrieval
+// is lang-agnostic, so a Go idiom can surface inside a Python file:
+// these markers veto what is unambiguously foreign. Kept minimal on
+// purpose: under-rejecting is better than killing a legit line.
+var langNever = map[string][]string{
+	"python":     {"func", "defer", "chan"},
+	"go":         {"def", "elif", "None", "self."},
+	"javascript": {"elif", "def", "func", "chan", "defer"},
+	"typescript": {"elif", "def", "func", "chan", "defer"},
+	"java":       {"def", "elif", "self."},
+	"c":          {"def", "elif", "self."},
+	"cpp":        {"def", "elif"},
+}
+
+// langSubNever lists substrings (not whole tokens) that are invalid
+// in the language.
+var langSubNever = map[string][]string{
+	"python":     {":=", "};"},
+	"go":         {"=>", "->"},
+	"javascript": {":=", "<-"},
+	"typescript": {":=", "<-"},
+	"rust":       {":="},
+	"java":       {":=", "<-"},
+	"c":          {":="},
+	"cpp":        {":="},
+}
+
+// foreignLine reports whether the first line of cand carries a marker
+// that cannot be valid in lang. lang "" or an unlisted language
+// passes everything.
+func foreignLine(cand, lang string) bool {
+	first := cand
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	for _, m := range langNever[lang] {
+		if strings.HasSuffix(m, ".") {
+			if strings.Contains(first, m) {
+				return true
+			}
+			continue
+		}
+		if indexTokBounded(first, m) >= 0 {
+			return true
+		}
+	}
+	for _, s := range langSubNever[lang] {
+		idx := strings.Index(first, s)
+		if idx < 0 {
+			continue
+		}
+		if s == ":=" && lang == "python" {
+			// Walrus is legal Python only inside an enclosing
+			// expression. The := is foreign when the text before it
+			// opens no bracket and starts no comprehension or
+			// conditional.
+			head, tl := first[:idx], strings.TrimLeft(first, " \t")
+			if !strings.ContainsAny(head, "([{") &&
+				!strings.HasPrefix(tl, "if ") && !strings.HasPrefix(tl, "while ") &&
+				!strings.HasPrefix(tl, "elif ") && !strings.HasPrefix(tl, "for ") &&
+				!strings.HasPrefix(tl, "return ") && !strings.HasPrefix(tl, "assert ") {
+				return true
+			}
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 // plausible rejects candidates that cannot extend the line at the
-// cursor. linePrefix is the text on the current line before it.
-func plausible(cand, linePrefix string) bool {
+// cursor. linePrefix is the text on the current line before it; lang
+// scopes the cross-language veto.
+func plausible(cand, linePrefix, lang string) bool {
 	c, ci := firstNonWS(cand)
 	if ci < 0 {
 		return false
 	}
 	last := exprTail(linePrefix)
+
+	// Cross-language bleed: a candidate that cannot exist in this
+	// file's language is dropped regardless of retrieval strength.
+	if foreignLine(cand, lang) {
+		return false
+	}
 
 	// After a dot only a member name (or a type assertion paren) is
 	// legal. This is the strongest filter: dot-position junk was the
@@ -77,13 +155,34 @@ func plausible(cand, linePrefix string) bool {
 		if tokenize.IsKeywordish(cand[ci:j]) {
 			return false
 		}
+		// A member continuation is one expression: statement
+		// separators and bare block braces on the first line mean
+		// retrieval glue, not a member.
+		first := cand
+		if nl := strings.IndexByte(first, '\n'); nl >= 0 {
+			first = first[:nl]
+		}
+		if strings.ContainsAny(first, ";{}") {
+			return false
+		}
 	}
 
 	// An opening brace right after an opening brace is retrieval
 	// noise: the corpus line continued with a nested block or the
-	// mask collapsed a literal.
+	// mask collapsed a literal. A bare "{" interior line is the same
+	// shape one level down.
 	if last == '{' && c == '{' {
 		return false
+	}
+	if strings.IndexByte(cand, '\n') >= 0 {
+		for _, l := range strings.Split(cand, "\n")[1:] {
+			// A lone opener inside the suggestion is an unclosed
+			// block glued by the chain decode; a lone closer is how
+			// blocks legitimately end.
+			if strings.TrimSpace(l) == "{" {
+				return false
+			}
+		}
 	}
 
 	// Trailing comment prose inside a multi-line candidate:

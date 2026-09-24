@@ -92,12 +92,14 @@ func DefaultConfig() Config {
 }
 
 type doc struct {
-	mu    sync.Mutex
-	gen   int // bumped per UpdateDoc. Stale builds are dropped
-	cache *model.Cache
-	lines []string // normalized nonblank lines, for the dynamic index
-	facts *facts   // member-memory extraction, merged into sessFacts
-	prev  string   // last built text: edit-rule diffs compare against it
+	mu     sync.Mutex
+	gen    int // bumped per UpdateDoc. Stale builds are dropped
+	cache  *model.Cache
+	lines  []string            // normalized nonblank lines, for the dynamic index
+	facts  *facts              // member-memory extraction, merged into sessFacts
+	blocks map[string][]string // normalized line -> next nonblank lines
+	prev   string              // last built text: edit-rule diffs compare against it
+	at     time.Time           // last UpdateDoc: freshest doc weighs most in dyn
 }
 
 // Engine is the live completion state: static model + line index plus
@@ -149,19 +151,20 @@ type Engine struct {
 
 	// Auxiliary model layers from the v3 bundle. All optional; a nil
 	// field disables that layer cleanly.
-	lineBi    *lines.GramIndex            // previous line(s) -> next line
-	struc     *model.Order                // lexical-context -> token counts
-	langs     map[string]*model.LangTable // per-language low-order tables
-	sub       *model.Model                // identifier subtoken model
-	idents    *model.IdentIndex           // subtoken path -> ident ids
-	cal       *Calibrator                 // journal-trained rank calibrator
-	mli       *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
-	fstarts   map[string][]string         // lang -> common first lines of a file
-	dirIds    map[string][]string         // dir -> top idents (dir cache + import adjacency)
-	dirSuf    map[string][]string         // path suffix -> dirs, for import resolution
-	tyMem     map[string][]string         // corpus type -> members (member memory)
-	callMem   map[string][]string         // corpus func -> member called on result
-	sessFacts *facts                      // merged member facts over open docs
+	lineBi     *lines.GramIndex            // previous line(s) -> next line
+	struc      *model.Order                // lexical-context -> token counts
+	langs      map[string]*model.LangTable // per-language low-order tables
+	sub        *model.Model                // identifier subtoken model
+	idents     *model.IdentIndex           // subtoken path -> ident ids
+	cal        *Calibrator                 // journal-trained rank calibrator
+	mli        *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
+	fstarts    map[string][]string         // lang -> common first lines of a file
+	dirIds     map[string][]string         // dir -> top idents (dir cache + import adjacency)
+	dirSuf     map[string][]string         // path suffix -> dirs, for import resolution
+	tyMem      map[string][]string         // corpus type -> members (member memory)
+	callMem    map[string][]string         // corpus func -> member called on result
+	sessFacts  *facts                      // merged member facts over open docs
+	sessBlocks map[string][]string         // merged line -> followers over open docs
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -459,7 +462,17 @@ func (e *Engine) loadJournalLocked() {
 			e.rejN[rec.Src]++
 			continue
 		}
-		if rec.Text == "" {
+		if rec.Text == "" || len(rec.Text) > 512 {
+			continue // oversized entries are drive noise, not code
+		}
+		bad := false
+		for i := 0; i < len(rec.Text); i++ {
+			if c := rec.Text[i]; c < 0x09 || (c > 0x0d && c < 0x20) {
+				bad = true
+				break
+			}
+		}
+		if bad {
 			continue
 		}
 		if e.m != nil {
@@ -666,6 +679,15 @@ func (e *Engine) LearnFor(user, uri, text string, line int) {
 		return
 	}
 	e.recordAccept(uri, text, line)
+	// Accepting an edit-propagated variant confirms the rewrite: the
+	// rule's clock resets so it keeps firing for remaining stale sites.
+	e.emu.Lock()
+	for i := range e.edits {
+		if e.edits[i].toS != "" && strings.Contains(text, e.edits[i].toS) {
+			e.edits[i].at = time.Now()
+		}
+	}
+	e.emu.Unlock()
 	if ov := e.overlayFor(user); ov != nil {
 		if e.m != nil {
 			ids := e.intern(text)
@@ -890,6 +912,7 @@ func (e *Engine) UpdateDoc(uri, text string) {
 	}
 	d.mu.Lock()
 	d.gen++
+	d.at = time.Now()
 	t := docTask{uri: uri, d: d, gen: d.gen}
 	if len(text) > e.cfg.MaxDocSize {
 		d.cache = nil
@@ -999,10 +1022,11 @@ func (e *Engine) drainOnce() bool {
 	// stall behind tokenization or cache construction.
 	type built struct {
 		docTask
-		ids   []uint32
-		cache *model.Cache
-		lines []string
-		facts *facts
+		ids    []uint32
+		cache  *model.Cache
+		lines  []string
+		facts  *facts
+		blocks map[string][]string
 	}
 	var bs []built
 	for _, t := range tasks {
@@ -1017,7 +1041,8 @@ func (e *Engine) drainOnce() bool {
 			c.Add(ids, e.eofID)
 		}
 		bs = append(bs, built{t, ids, c, docLines(t.text),
-			extractFactsToks(tokenize.Lex([]byte(t.text)))})
+			extractFactsToks(tokenize.Lex([]byte(t.text))),
+			blocksFor(t.text)})
 	}
 
 	// Install per-doc results under each doc's own lock. Docs updated
@@ -1034,6 +1059,7 @@ func (e *Engine) drainOnce() bool {
 			b.d.cache = b.cache
 			b.d.lines = b.lines
 			b.d.facts = b.facts
+			b.d.blocks = b.blocks
 			live = append(live, b)
 		}
 		b.d.mu.Unlock()
@@ -1083,6 +1109,7 @@ func (e *Engine) drainOnce() bool {
 	var src [][]string
 	if rebuild {
 		sf := newFacts()
+		sb := map[string][]string{}
 		e.docs.Range(func(_, v any) bool {
 			d := v.(*doc)
 			d.mu.Lock()
@@ -1092,11 +1119,41 @@ func (e *Engine) drainOnce() bool {
 			if d.facts != nil {
 				sf.merge(d.facts)
 			}
+			for k, fol := range d.blocks {
+				if _, dup := sb[k]; !dup {
+					sb[k] = fol
+				}
+			}
 			d.mu.Unlock()
 			return true
 		})
 		e.sessFacts = sf
+		e.sessBlocks = sb
 		src = append(src, e.learnLines, e.deltaLines)
+		// The doc being edited right now is the most likely source of
+		// what repeats next: its lines count double in the dyn index.
+		var lastURI string
+		var lastAt time.Time
+		e.docs.Range(func(k, v any) bool {
+			d := v.(*doc)
+			d.mu.Lock()
+			at := d.at
+			d.mu.Unlock()
+			if at.After(lastAt) {
+				lastAt, lastURI = at, k.(string)
+			}
+			return true
+		})
+		if lastURI != "" {
+			if dv, ok := e.docs.Load(lastURI); ok {
+				d := dv.(*doc)
+				d.mu.Lock()
+				if len(d.lines) > 0 {
+					src = append(src, d.lines)
+				}
+				d.mu.Unlock()
+			}
+		}
 	}
 	e.mu.Unlock()
 
@@ -1187,6 +1244,7 @@ type Item struct {
 	scopeHits int
 	memHit    bool
 	learnHit  bool
+	modelP    float64 // mean per-token n-gram probability of the first line
 }
 
 // isIdentStart reports whether c can start an identifier (no digits).
@@ -1199,7 +1257,7 @@ func isIdentByte(c byte) bool {
 }
 
 // Feature flags for A/B debugging:
-// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk
+// Q4TAB_DISABLE=adapt,scope,unit,cliff,prior,heal,qual,iter,imp,mmr,src,embed,mem,edit,rank,blk,snip,gate
 const (
 	fAdapt = 1 << iota
 	fScope
@@ -1217,6 +1275,8 @@ const (
 	fEdit
 	fRank
 	fBlk
+	fSnip
+	fGate
 )
 
 func disabledFeatures() int {
@@ -1255,6 +1315,10 @@ func disabledFeatures() int {
 			d |= fRank
 		case "blk":
 			d |= fBlk
+		case "snip":
+			d |= fSnip
+		case "gate":
+			d |= fGate
 		}
 	}
 	return d
@@ -1387,12 +1451,26 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 
 		verbatimHit := false
+		localHit := false // same-file or session repeat: strongest precision
 		if len(text) <= e.cfg.MaxDocSize {
 			for _, c := range fileLines(text, linePrefix, exclude, curLineIdx, 3) {
 				if ok := e.accept(c, ns, restN); ok && !seen[c] {
 					seen[c] = true
 					verbatimHit = true
+					localHit = true
 					items = append(items, mk(c, "file", w.File))
+				}
+			}
+			// Same-file blocks: the attested continuation plus the next
+			// lines verbatim. Strongest at table tests, handler pairs,
+			// and per-field boilerplate where a repeat is a block, not
+			// a line.
+			if dis&fSnip == 0 {
+				for _, c := range fileBlockLines(text, linePrefix, exclude, curLineIdx, 2) {
+					if ok := e.accept(c, ns, restN); ok && !seen[c] {
+						seen[c] = true
+						items = append(items, mk(c, "file+blk", w.File*0.8))
+					}
 				}
 			}
 			// The same file with caller's names rebound: repeats that
@@ -1410,13 +1488,29 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 
 		// Dynamic overlay: lines from other open documents and learned
-		// completions.
+		// completions. Each hit also checks the session block map for
+		// attested follower lines so a repeated two-or-three-line chunk
+		// surfaces whole.
 		if di := e.dynIndex(); di != nil {
+			norm := lines.Normalize(linePrefix)
+			indent := leadingWS(linePrefix)
+			snips := 0
 			for _, c := range di.Complete(linePrefix, e.cfg.MaxItems*2, 4096) {
 				if ok := e.accept(c.Text, ns, restN); ok && !seen[c.Text] {
 					seen[c.Text] = true
 					verbatimHit = true
+					localHit = true
 					items = append(items, mk(c.Text, "file", w.Dyn+float64(c.Count)))
+				}
+				if dis&fSnip == 0 && snips < 2 && len(e.sessBlocks) > 0 {
+					if fol := e.sessBlocks[norm+c.Text]; len(fol) > 0 {
+						full := c.Text + "\n" + indent + strings.Join(fol, "\n"+indent)
+						if ok := e.accept(full, ns, restN); ok && !seen[full] {
+							seen[full] = true
+							items = append(items, mk(full, "file+blk", w.Dyn*0.8+float64(c.Count)))
+							snips++
+						}
+					}
 				}
 			}
 		}
@@ -1529,8 +1623,16 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			}
 		}
 
+		// Selective generation (Repoformer): when the file or session
+		// already produced multiple attested repeats, the n-gram decode
+		// mostly re-derives those same lines at a fraction of their
+		// score. Skipping it is the dominant latency win. Dot position
+		// and thin contexts stay ungated: member and opening requests
+		// need the model's breadth.
+		atDotPos := strings.HasSuffix(strings.TrimRight(linePrefix, " \t"), ".")
+		skipGen := dis&fGate == 0 && localHit && len(items) >= 3 && !atDotPos
 		// Model generation with cache mixing.
-		if e.m != nil {
+		if e.m != nil && !skipGen {
 			for _, it := range e.generate(user, uri, text, offset, linePrefix) {
 				if ok := e.accept(it.Text, ns, restN); ok && !seen[it.Text] {
 					seen[it.Text] = true
@@ -1664,17 +1766,34 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			e.emu.Unlock()
 			if len(rules) > 0 {
 				var vars []Item
-				for _, it := range items {
+				var staleIdx []int
+				for i, it := range items {
 					for _, r := range rules {
+						if time.Since(r.at) > 45*time.Minute {
+							continue // stale rules decay: old renames stop applying
+						}
 						if nv, ok := r.apply(it.Text); ok && nv != it.Text && !seen[nv] && e.accept(nv, ns, restN) {
 							seen[nv] = true
-							vars = append(vars, mk(nv, it.Source+"+edit", it.Score*0.85))
+							vars = append(vars, mk(nv, it.Source+"+edit", it.Score*0.95))
+							staleIdx = append(staleIdx, i)
+							break
 						}
 					}
+					if len(vars) >= 6 {
+						break
+					}
+				}
+				// The renamed-away name is probably wrong now: the
+				// variant outranks the stale original it grew from.
+				for _, i := range staleIdx {
+					items[i].Score *= 0.8
 				}
 				items = append(items, vars...)
 				for i := range items {
 					for _, r := range rules {
+						if time.Since(r.at) > 45*time.Minute {
+							continue
+						}
 						if r.touches(items[i].Text) {
 							items[i].Score *= 1.12
 							break
@@ -1689,7 +1808,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		// keywords in operand position).
 		kept := items[:0]
 		for _, it := range items {
-			if plausible(it.Text, linePrefix) {
+			if plausible(it.Text, linePrefix, lang) {
 				kept = append(kept, it)
 			}
 		}
@@ -1704,9 +1823,19 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		}
 
 		// Post-pass per item: learned-line boost and fill-in-the-middle
-		// verification.
+		// verification. The model-attestation probability feeds the
+		// reranker feature; ctx/query are computed lazily once.
+		var mctx []uint32
+		var mq *model.Query
 		for i := range items {
 			it := &items[i]
+			if e.m != nil && it.modelP == 0 {
+				if mctx == nil {
+					mctx = lookupCtx(e.m, prefix)
+					mq = e.m.NewQuery()
+				}
+				it.modelP = restProb(e.m, firstLineOf(it.Text), mctx, mq)
+			}
 			// In-scope identifiers: candidates reusing names the
 			// document already declared are likelier to be right.
 			// Frequency-weighted (nested cache model): an ident seen

@@ -3,6 +3,7 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"q4tab/internal/tokenize"
 )
@@ -177,10 +178,39 @@ func TestPlausibleFilters(t *testing.T) {
 		{"dot junk in operand", ".N; i := 0", "ch <-", false},
 		{"comment prose midline", "i++ {\n\t}// The completed {", "for x", false},
 		{"comment lowercase ok", "i++ // bump it", "for x", true},
+		{"member stmt junk", "N; i < b", "s.st.", false},
+		{"member chain ok", "Get().String()", "s.st.", true},
+		{"member brace junk", "N {", "s.st.", false},
 	}
 	for _, c := range cases {
-		if got := plausible(c.cand, c.line); got != c.want {
+		if got := plausible(c.cand, c.line, "go"); got != c.want {
 			t.Errorf("%s: plausible(%q, %q) = %v, want %v", c.name, c.cand, c.line, got, c.want)
+		}
+	}
+}
+
+func TestForeignLineVeto(t *testing.T) {
+	cases := []struct {
+		cand, lang string
+		want       bool // true = foreign, drop it
+	}{
+		{"MarshalIndent(v)", "python", false},
+		{"x := f()", "python", true},      // bare := statement is Go
+		{"(x := f())", "python", false},   // walrus in a call is legal
+		{"if x := f():", "python", false}, // walrus in a conditional
+		{"};", "python", true},            // python never closes with };
+		{"elif x:", "go", true},           // elif is python/rust-less
+		{"self.x", "go", true},
+		{"fmt.Println()", "python", false}, // fmt. is a substr, not a token: passes
+		{"a := b", "javascript", true},
+		{"x = ch <- v", "typescript", true},
+		{"s.items[i]", "python", false},
+		{"def helper():", "go", true},
+		{"x := 1", "go", false}, // home lang keeps it
+	}
+	for _, c := range cases {
+		if got := foreignLine(c.cand, c.lang); got != c.want {
+			t.Errorf("foreignLine(%q, %q) = %v, want %v", c.cand, c.lang, got, c.want)
 		}
 	}
 }
@@ -496,7 +526,7 @@ func TestEditPropagationEndToEnd(t *testing.T) {
 	e.emu.Lock()
 	e.edits = append(e.edits, editRule{
 		from: []string{"items"}, to: []string{"jobs"},
-		fromS: "items", toS: "jobs",
+		fromS: "items", toS: "jobs", at: time.Now(),
 	})
 	e.emu.Unlock()
 	// Cursor sits after "s.": file repeats offer "items[...]" and the

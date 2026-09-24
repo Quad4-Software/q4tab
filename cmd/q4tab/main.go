@@ -149,6 +149,12 @@ func runTune(cfg config, roots []string, nFiles, perFile int, seed int64, log fu
 		} else {
 			log("journal: %d events, too few to train (need 256)", len(evs))
 		}
+		// Feature-vector events (written since the reranker landed)
+		// batch-train the online ranker so it starts warm.
+		if rk := engine.TrainRanker(evs, 64); rk != nil {
+			rk.Save(defaultJournalPath() + ".rank")
+			log("journal: reranker batch-trained on feature events")
+		}
 	}
 	// Phase 2: deleted interpolation, cross-validated on this holdout.
 	// Scales are trained on the holdout token stream, then kept only if

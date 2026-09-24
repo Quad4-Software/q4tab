@@ -26,7 +26,7 @@ var featNames = []string{
 	"srcFile", "srcDyn", "srcAdapt", "srcCorpus", "srcModel",
 	"srcMem", "srcLineBi", "srcPrior", "srcIter", "srcUnit", "srcEdit",
 	"multiLine", "scopeHits", "memHit", "thinCtx",
-	"candLen", "atDot", "argPos", "learnHit",
+	"candLen", "atDot", "argPos", "learnHit", "modelProb",
 }
 
 var featDim = len(featNames)
@@ -104,6 +104,10 @@ func itemFeat(it *Item, scopeHits int, memHit, thinCtx, atDot, argPos, learnHit 
 	if learnHit {
 		f[20] = 1
 	}
+	// Model attestation: the mean per-token n-gram probability of the
+	// first line. Retrieval hits score high here too when they fit the
+	// context; adapt noise and stale variants score low.
+	f[21] = float32(math.Min(math.Max(it.modelP, 0), 1))
 	return f
 }
 
@@ -166,6 +170,43 @@ func (r *Ranker) saveIfDirty(path string) {
 	}
 	w := append([]float64(nil), r.w...)
 	r.dirty = 0
+	r.mu.Unlock()
+	data, _ := json.Marshal(w)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err == nil {
+		os.Rename(tmp, path)
+	}
+}
+
+// TrainRanker batch-fits the online model over journaled feature
+// vectors: several SGD epochs over the recorded shown/accept pairs.
+// Returns nil when too few events carry features.
+func TrainRanker(evs []JournalEvent, minEvents int) *Ranker {
+	n := 0
+	for _, e := range evs {
+		if len(e.Feat) > 0 {
+			n++
+		}
+	}
+	if n < minEvents {
+		return nil
+	}
+	r := NewRanker()
+	for epoch := 0; epoch < 6; epoch++ {
+		for _, e := range evs {
+			if len(e.Feat) == 0 {
+				continue
+			}
+			r.update(e.Feat, e.Kind == "a")
+		}
+	}
+	return r
+}
+
+// Save writes the weight vector, atomically.
+func (r *Ranker) Save(path string) {
+	r.mu.Lock()
+	w := append([]float64(nil), r.w...)
 	r.mu.Unlock()
 	data, _ := json.Marshal(w)
 	tmp := path + ".tmp"

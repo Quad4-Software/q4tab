@@ -20,12 +20,13 @@ import (
 
 // JournalEvent is one labeled accept ("a") or reject ("r") record.
 type JournalEvent struct {
-	Kind  string  `json:"e"`           // "a" or "r"
-	Src   string  `json:"s"`           // base source: model, file, corpus, dyn, learn
-	Score float64 `json:"v"`           // item score at display time
-	Rank  int     `json:"r"`           // position in the shown list
-	Len   int     `json:"l,omitempty"` // suggestion length in bytes
-	Multi bool    `json:"m,omitempty"` // suggestion spans multiple lines
+	Kind  string    `json:"e"`           // "a" or "r"
+	Src   string    `json:"s"`           // base source: model, file, corpus, dyn, learn
+	Score float64   `json:"v"`           // item score at display time
+	Rank  int       `json:"r"`           // position in the shown list
+	Len   int       `json:"l,omitempty"` // suggestion length in bytes
+	Multi bool      `json:"m,omitempty"` // suggestion spans multiple lines
+	Feat  []float32 `json:"f,omitempty"` // reranker feature vector, when computed
 }
 
 // LoadJournalEvents reads labeled events from the journal, keeping at
