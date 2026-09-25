@@ -105,3 +105,27 @@ The build records the top identifiers per directory. At query time the
 current file's directory and its import paths contribute a weak scope
 prior, so idioms from a package you import surface without dominating
 same-file evidence.
+
+## Infix continuation
+
+The line indexes match at line starts only. When the cursor sits
+mid-statement - the tail of `w, http.StatusOK, map[string]any{` - the
+operand run after the last separator becomes a needle and a flat scan
+over the session line pool (open docs, learned lines, delta tail)
+emits what followed the match inside longer lines. Needle length
+scales the score; open-doc lines are scanned before delta noise.
+
+## Reject suppression
+
+Every shown-but-skipped or explicitly rejected item leaves its masked
+shape at that (document, line) site for five minutes. A re-request at
+the same site demotes the same shapes, so the picker does not keep
+re-offering the answer that was just refused.
+
+## Display policy
+
+Three gates sit on top of scoring: shape dedupe removes identifier-
+only twins, source diversity promotes a near-peer alternative into the
+tail slot when one family sweeps the list, and next-line guesses from
+the corpus bigram are capped at session strength when the cursor is
+mid-line so speculative continuations cannot outrank attested text.
