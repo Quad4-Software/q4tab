@@ -547,3 +547,97 @@ func TestEditPropagationEndToEnd(t *testing.T) {
 		t.Fatalf("no jobs variant propagated; items=%v", got)
 	}
 }
+
+func TestFactsGenericsAndAlias(t *testing.T) {
+	src := `package a
+
+type Box[T any] struct {
+	vals []T
+}
+
+func (b *Box[T]) Push(v T) {}
+func (b *Box[T]) Len() int { return 0 }
+
+type Registry = Store
+
+type Store struct{}
+func (s *Store) Load(k string) {}
+
+type Sup struct {
+	Store
+	extra int
+}
+
+func NewBox[T any]() *Box[T] { return nil }
+
+func use() {
+	var b Box[int]
+	bx := NewBox[int]()
+	_ = b
+	_ = bx
+}
+`
+	f := extractFactsToks(tokenize.Lex([]byte(src)))
+	if f.recv["b"] != "Box" {
+		t.Fatalf("generic var: recv[b] = %q, want Box", f.recv["b"])
+	}
+	if f.recv["bx"] != "Box" {
+		t.Fatalf("generic ctor: recv[bx] = %q, want Box", f.recv["bx"])
+	}
+	if !f.tyMem["Box"]["Push("] {
+		t.Fatalf("generic receiver method missing: %v", f.tyMem["Box"])
+	}
+	if f.alias["Registry"] != "Store" {
+		t.Fatalf("alias = %q, want Store", f.alias["Registry"])
+	}
+	// Embedded field records name==type.
+	if f.tyFld["Sup"]["Store"] != "Store" {
+		t.Fatalf("embedded field = %q", f.tyFld["Sup"])
+	}
+
+	e := buildEngine(t, DefaultConfig())
+	e.UpdateDoc("file:///g.go", src)
+	e.Flush()
+	text := "package a\n\nfunc f(r *Registry) {\n\tr."
+	if it := e.Complete("file:///g.go", text, len(text)); !hasText(it, "Load(") {
+		t.Fatalf("alias member missing: %v", texts(it))
+	}
+	text2 := "package a\n\nfunc f2(s *Sup) {\n\ts."
+	if it := e.Complete("file:///g.go", text2, len(text2)); !hasText(it, "Load(") {
+		t.Fatalf("embedded member missing: %v", texts(it))
+	}
+	text3 := "package a\n\nfunc f3(bx *Box[int]) {\n\tbx."
+	if it := e.Complete("file:///g.go", text3, len(text3)); !hasText(it, "Push(") {
+		t.Fatalf("generic member missing: %v", texts(it))
+	}
+}
+
+func TestNextEditHints(t *testing.T) {
+	e := buildEngine(t, DefaultConfig())
+	v1 := "package a\n\ntype Cfg struct {\n\titems int\n}\n\nfunc f(c *Cfg) {\n\t_ = c.items\n\t_ = c.items\n}\n"
+	e.UpdateDoc("file:///ne.go", v1)
+	e.Flush()
+	// Rename in the decl: items -> jobs.
+	v2 := strings.Replace(v1, "items int", "jobs   int", 1)
+	e.UpdateDoc("file:///ne.go", v2)
+	e.Flush()
+	hints := e.NextEdit(8)
+	var jobs int
+	for _, h := range hints {
+		if strings.Contains(h.New, "jobs") && strings.Contains(h.Old, "items") {
+			jobs++
+		}
+	}
+	if jobs < 1 {
+		t.Fatalf("no next-edit hint for rename: %v", hints)
+	}
+	// Stale sites exhausted -> no hint.
+	v3 := strings.ReplaceAll(v2, "c.items", "c.jobs")
+	e.UpdateDoc("file:///ne.go", v3)
+	e.Flush()
+	for _, h := range e.NextEdit(8) {
+		if strings.Contains(h.Old, "items") {
+			t.Fatalf("hint on clean doc: %v", h)
+		}
+	}
+}

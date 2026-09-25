@@ -128,6 +128,15 @@ func (s *Server) dispatchAs(user string, m *Message) (any, *rpcError) {
 		return s.completionAs(user, p), nil
 	case "q4/status":
 		return s.eng.Stats(), nil
+	case "q4/nextEdit":
+		// Predicted next edit sites: lines still carrying the old
+		// side of a recent rename/rewrite. Editors jump and ghost.
+		var p struct {
+			URI   string `json:"uri"`
+			Limit int    `json:"limit"`
+		}
+		json.Unmarshal(m.Params, &p)
+		return map[string]any{"items": s.eng.NextEdit(p.Limit)}, nil
 	case "q4/learn":
 		var p struct {
 			Text string `json:"text"`

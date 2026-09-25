@@ -154,3 +154,77 @@ func indexTokBounded(s, needle string) int {
 func (r *editRule) touches(cand string) bool {
 	return r.toS != "" && strings.Contains(cand, r.toS)
 }
+
+// NextEditHint is a predicted next edit site: a line still carrying
+// the old side of a recent rewrite rule, plus the replacement text.
+type NextEditHint struct {
+	URI  string `json:"uri"`
+	Line int    `json:"line"`
+	Char int    `json:"char"`
+	Old  string `json:"old"`
+	New  string `json:"new"`
+}
+
+// NextEdit returns the most likely next edit sites: locations where a
+// recent rewrite rule's old side still appears. This is the
+// next-edit half of the edit-rule machinery: propagation rewrites
+// suggestions, prediction locates the places worth visiting. Rules
+// fire newest-first across every open document.
+func (e *Engine) NextEdit(limit int) []NextEditHint {
+	if limit <= 0 {
+		limit = 8
+	}
+	e.emu.Lock()
+	rules := append([]editRule(nil), e.edits...)
+	e.emu.Unlock()
+	var out []NextEditHint
+	type seen struct {
+		uri  string
+		line int
+	}
+	dedup := map[seen]bool{}
+	e.docs.Range(func(k, v any) bool {
+		d := v.(*doc)
+		d.mu.Lock()
+		text := d.prev
+		d.mu.Unlock()
+		if text == "" {
+			return true
+		}
+		docLines := strings.Split(text, "\n")
+		// Newest rules are the freshest intent; walk back to front.
+		for ri := len(rules) - 1; ri >= 0 && len(out) < limit; ri-- {
+			r := rules[ri]
+			if r.fromS == "" || r.fromS == r.toS {
+				continue
+			}
+			for li, l := range docLines {
+				col := strings.Index(l, r.fromS)
+				if col < 0 {
+					continue
+				}
+				// A line already carrying the new side is done.
+				if r.toS != "" && strings.Contains(l, r.toS) {
+					continue
+				}
+				key := seen{k.(string), li}
+				if dedup[key] {
+					continue
+				}
+				dedup[key] = true
+				out = append(out, NextEditHint{
+					URI:  key.uri,
+					Line: li,
+					Char: col,
+					Old:  r.fromS,
+					New:  strings.Replace(l, r.fromS, r.toS, 1),
+				})
+				if len(out) >= limit {
+					break
+				}
+			}
+		}
+		return len(out) < limit
+	})
+	return out
+}

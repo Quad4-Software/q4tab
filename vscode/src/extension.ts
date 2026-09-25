@@ -604,6 +604,50 @@ export async function activate(context: vscode.ExtensionContext) {
     ),
   );
 
+  // Next-edit jump: ask the server where a recent rewrite still
+  // needs applying, move the cursor there, and let inline suggest
+  // offer the rewritten line.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("q4tab.nextEdit", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!client || !editor) {
+        return;
+      }
+      try {
+        const res = (await client.sendRequest("q4/nextEdit", {
+          uri: editor.document.uri.toString(),
+          limit: 8,
+        })) as { items?: { uri: string; line: number; char: number }[] };
+        const hint = res?.items?.[0];
+        if (!hint) {
+          return;
+        }
+        let doc = editor.document;
+        if (hint.uri && hint.uri !== doc.uri.toString()) {
+          doc = await vscode.workspace.openTextDocument(
+            vscode.Uri.parse(hint.uri),
+          );
+          await vscode.window.showTextDocument(doc);
+        }
+        const pos = new vscode.Position(hint.line, hint.char);
+        const ed = vscode.window.activeTextEditor;
+        if (!ed) {
+          return;
+        }
+        ed.selection = new vscode.Selection(pos, pos);
+        ed.revealRange(
+          new vscode.Range(pos, pos),
+          vscode.TextEditorRevealType.InCenter,
+        );
+        await vscode.commands.executeCommand(
+          "editor.action.inlineSuggest.trigger",
+        );
+      } catch (err) {
+        log.appendLine(`nextEdit: ${err}`);
+      }
+    }),
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand("q4tab.menu", showMenu),
   );

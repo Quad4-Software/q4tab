@@ -107,6 +107,9 @@ func loadEngine(cfg config) *engine.Engine {
 		return e
 	}
 	e.SetBundle(bun)
+	// The aux sidecar carries member/directory tables for corpus files
+	// the base model predates; entries the model already has win.
+	e.MergeAux(engine.LoadAux(defaultModelPath() + ".aux"))
 	if delta, err := engine.LoadDelta(defaultModelPath() + ".delta"); err == nil {
 		e.InstallDelta(delta)
 	}
@@ -382,6 +385,7 @@ func main() {
 		workers := fs.Int("workers", 0, "spill build lexer/emitter workers (0 = cores - 1, capped at 8)")
 		tmpdir := fs.String("tmpdir", "", "spill build run-file directory (default = system temp)")
 		incr := fs.Bool("incr", false, "incremental: fold changed files into the delta overlay")
+		auxOnly := fs.Bool("aux", false, "aux tables only: member/directory/file-start tables, no n-gram build")
 		var roots multiFlag
 		fs.Var(&roots, "root", "corpus root directory (repeatable)")
 		fs.Parse(os.Args[2:])
@@ -404,6 +408,23 @@ func main() {
 				return
 			}
 			log("index: falling back to a full build")
+		}
+		if *auxOnly {
+			// The small tables need no spill: a cold file completes
+			// members from TypeMem and CallMem even when a full
+			// n-gram rebuild is not practical.
+			ax, err := engine.BuildAux(roots, os.Stderr)
+			if err != nil {
+				log("index -aux: %v", err)
+				os.Exit(1)
+			}
+			if err := engine.SaveAux(*out+".aux", ax); err != nil {
+				log("index -aux: %v", err)
+				os.Exit(1)
+			}
+			log("wrote %s.aux (%d types, %d calls, %d dirs)", *out,
+				len(ax.TypeMem), len(ax.CallMem), len(ax.DirIdents))
+			return
 		}
 		if *memMB == 0 {
 			*memMB = defaultMemCapMB()

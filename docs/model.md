@@ -45,6 +45,14 @@ small corpora but scales memory with token count.
 Deletions drop out of the delta; lines deleted long ago linger in the
 base until a full rebuild folds everything back.
 
+## Aux sidecar
+
+`index -aux` walks the corpus extracting only the small tables -
+type members, call members, directory idents, file-start priors - and
+writes model.bin.aux (tens of MB, no spill). The server merges it at
+startup, so corpus-wide member memory works on cold files even when a
+full n-gram rebuild is not practical on the local disk budget.
+
 ## Weight tuning
 
 `q4tab tune` runs coordinate descent over a holdout corpus and

@@ -85,12 +85,21 @@
       {
         "command": "q4tab.menu",
         "title": "q4tab: Menu"
+      },
+      {
+        "command": "q4tab.nextEdit",
+        "title": "q4tab: Jump to Next Edit"
       }
     ],
     "keybindings": [
       {
         "command": "q4tab.trigger",
         "key": "alt+\\",
+        "when": "editorTextFocus && !editorReadonly"
+      },
+      {
+        "command": "q4tab.nextEdit",
+        "key": "alt+]",
         "when": "editorTextFocus && !editorReadonly"
       }
     ]

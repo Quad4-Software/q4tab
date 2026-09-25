@@ -1830,7 +1830,18 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 						seen[m] = true
 						sc := w.Dyn * 2
 						if corpOnly {
+							// Corpus members come from name collisions
+							// too: every File in the world claims its
+							// methods. Bias toward names the corpus
+							// uses often so Close beats a one-off
+							// exotic member from some other File.
 							sc = w.Dyn * 1.5
+							if e.m != nil {
+								base := strings.TrimSuffix(m, "(")
+								if id, ok := e.m.Vocab.Lookup(" " + base); ok && int(id) < len(e.m.Uni) {
+									sc *= 1 + 0.15*math.Log1p(float64(e.m.Uni[id]))
+								}
+							}
 						}
 						items = append(items, mk(m, "mem", sc))
 						if memNames == nil {

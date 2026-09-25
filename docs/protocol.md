@@ -29,7 +29,9 @@ one socket cannot leak into another.
 `textDocument/inlineCompletion` (LSP 3.18, UTF-16 positions) is the
 editor-facing path. `q4/learn` and `q4/reject` feed the accept loop.
 `q4/status` exposes counters. `workspace/executeCommand` accepts
-`q4tab.learn`.
+`q4tab.learn`. `q4/nextEdit` returns predicted next edit sites -
+lines still carrying the old side of a recent rename - for the
+VS Code q4tab.nextEdit jump command (alt+]).
 
 ## MCP
 

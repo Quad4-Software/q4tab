@@ -24,6 +24,7 @@ type facts struct {
 	tyFld map[string]map[string]string // type -> field name -> field type
 	callM map[string]map[string]int    // func name -> member invoked on its result
 	retT  map[string]string            // func or method name -> first non-builtin result type
+	alias map[string]string            // type A = B / type A B where B is a named type
 	decls map[string]bool              // top-level declared names (var/const/type/func)
 }
 
@@ -35,6 +36,7 @@ func newFacts() *facts {
 		tyFld: map[string]map[string]string{},
 		callM: map[string]map[string]int{},
 		retT:  map[string]string{},
+		alias: map[string]string{},
 		decls: map[string]bool{},
 	}
 }
@@ -83,6 +85,9 @@ func (f *facts) merge(o *facts) {
 	}
 	for fn, t := range o.retT {
 		f.retT[fn] = t
+	}
+	for k, v := range o.alias {
+		f.alias[k] = v
 	}
 	for d := range o.decls {
 		f.decls[d] = true
@@ -222,6 +227,12 @@ func extractFactsToks(toks []string) *facts {
 			}
 			f.decls[name] = true
 			k := nonWS(toks, j+1)
+			if atTok(toks, k) == "[" {
+				// Generic decl: type Box[T any] struct { ... }
+				if e := matchBracket(toks, k); e > 0 {
+					k = nonWS(toks, e+1)
+				}
+			}
 			switch atTok(toks, k) {
 			case "struct":
 				k = nonWS(toks, k+1)
@@ -234,6 +245,12 @@ func extractFactsToks(toks []string) *facts {
 				k = nonWS(toks, k+1)
 				if atTok(toks, k) == "{" {
 					scanTypeBody(toks, k+1, name, f)
+				}
+			case "=":
+				// type A = pkg.B: alias resolution lets a. see B's
+				// members through the alias.
+				if a := lastTypeIdent(toks, nonWS(toks, k+1)); a != "" {
+					f.alias[name] = a
 				}
 			}
 		case "class", "interface":
@@ -312,7 +329,8 @@ func extractFactsToks(toks []string) *facts {
 }
 
 // recvDecl parses "( r * T )" or "( r T )" starting at the "(" index.
-// Returns the receiver name, its type, and the index of ")".
+// Returns the receiver name, its type, and the index of ")". Generic
+// receivers like "(b *Box[T])" skip the instantiation bracket.
 func recvDecl(toks []string, open int) (name, typ string, end int) {
 	var ids []string
 	for i := open + 1; i < len(toks); i++ {
@@ -323,6 +341,12 @@ func recvDecl(toks []string, open int) (name, typ string, end int) {
 		}
 		if t == tokenize.NL {
 			return "", "", 0
+		}
+		if t == "[" {
+			if cl := matchBracket(toks, i); cl > 0 {
+				i = cl
+				continue
+			}
 		}
 		if identTok(t) {
 			ids = append(ids, t)
@@ -405,15 +429,21 @@ func (f *facts) assignedType(v string, toks []string, k int) {
 		k = nonWS(toks, k2+1)
 		cand = atTok(toks, k)
 	}
-	if strings.HasPrefix(cand, "New") && len(cand) > 3 &&
-		atTok(toks, nonWS(toks, k+1)) == "(" {
+	// Generic instantiation: Ctor[T](...) / T[K]{...} — the bracket
+	// holds type args, skip it to reach the call or literal.
+	next := atTok(toks, nonWS(toks, k+1))
+	if next == "[" {
+		if e := matchBracket(toks, nonWS(toks, k+1)); e > 0 {
+			next = atTok(toks, nonWS(toks, e+1))
+		}
+	}
+	if strings.HasPrefix(cand, "New") && len(cand) > 3 && next == "(" {
 		f.recv[v] = cand[3:]
 		return
 	}
 	if cand == "" {
 		return
 	}
-	next := atTok(toks, nonWS(toks, k+1))
 	// Any capitalized call is a constructor in most languages:
 	// Session(...), Queue(), ReadCloser(...
 	if cand[0] >= 'A' && cand[0] <= 'Z' && next == "(" {
@@ -583,16 +613,22 @@ func builtinType(s string) bool {
 
 // resultType scans the tokens after a signature's closing ")" for
 // the result list and returns the last non-builtin type ident:
-// "(*Job, error)" -> Job, "*Queue" -> Queue, "error" -> "".
+// "(*Job, error)" -> Job, "*Queue" -> Queue, "error" -> "". Type
+// parameters inside brackets are instantiation args, not the type.
 func resultType(toks []string, close int) string {
 	last := ""
+	depth := 0
 	for i := close + 1; i < len(toks); i++ {
 		t := toks[i]
 		switch t {
+		case "[":
+			depth++
+		case "]":
+			depth--
 		case "{", tokenize.NL, ";":
 			return last
 		}
-		if identTok(t) && !builtinType(t) {
+		if depth == 0 && identTok(t) && !builtinType(t) {
 			last = t
 		}
 	}
@@ -790,16 +826,39 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map
 			return nil, false
 		}
 		nt := ""
-		if doc != nil && doc.tyFld[typ] != nil {
-			nt = doc.tyFld[typ][link]
-		}
-		if nt == "" && sess != nil && sess.tyFld[typ] != nil {
-			nt = sess.tyFld[typ][link]
+		for _, f := range []*facts{doc, sess} {
+			if f == nil {
+				continue
+			}
+			if row := f.tyFld[typ]; row != nil && row[link] != "" {
+				nt = row[link]
+				break
+			}
+			// Field lookup through an alias: type A = B stores
+			// B's fields under B.
+			if at := f.alias[typ]; at != "" && f.tyFld[at] != nil && f.tyFld[at][link] != "" {
+				nt = f.tyFld[at][link]
+				break
+			}
 		}
 		typ = nt
 	}
 	if typ == "" {
 		return nil, false
+	}
+	// Alias chase: bounded, so alias loops terminate.
+	for hop := 0; hop < 4; hop++ {
+		nt := ""
+		for _, f := range []*facts{doc, sess} {
+			if f != nil && f.alias[typ] != "" {
+				nt = f.alias[typ]
+				break
+			}
+		}
+		if nt == "" || nt == typ {
+			break
+		}
+		typ = nt
 	}
 	seen := map[string]bool{}
 	var out []string
@@ -809,19 +868,50 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map
 			out = append(out, m)
 		}
 	}
-	if doc != nil {
-		for m := range doc.tyMem[typ] {
+	collect := func(t string) {
+		if doc != nil {
+			for m := range doc.tyMem[t] {
+				add(m)
+			}
+		}
+		if sess != nil {
+			for m := range sess.tyMem[t] {
+				add(m)
+			}
+		}
+		for _, m := range tyMem[t] {
 			add(m)
 		}
 	}
-	if sess != nil {
-		for m := range sess.tyMem[typ] {
-			add(m)
+	collect(typ)
+	// Embedded fields promote: "type A struct { B }" offers B's
+	// methods on a. directly. One hop is enough for ranking.
+	for _, f := range []*facts{doc, sess} {
+		if f == nil {
+			continue
+		}
+		for fld, ft := range f.tyFld[typ] {
+			if fld != ft {
+				continue
+			}
+			for _, f2 := range []*facts{doc, sess} {
+				if f2 == nil {
+					continue
+				}
+				for m := range f2.tyMem[ft] {
+					add(m)
+				}
+			}
+			for _, m := range tyMem[ft] {
+				add(m)
+			}
 		}
 	}
-	nSess := len(out)
-	for _, m := range tyMem[typ] {
-		add(m)
+	nSess := 0
+	for _, f := range []*facts{doc, sess} {
+		if f != nil {
+			nSess += len(f.tyMem[typ])
+		}
 	}
 	sortMembers(out)
 	return out, nSess == 0 && len(out) > 0
