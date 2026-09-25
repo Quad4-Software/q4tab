@@ -27,7 +27,7 @@ var featNames = []string{
 	"srcMem", "srcLineBi", "srcPrior", "srcIter", "srcUnit", "srcEdit",
 	"multiLine", "scopeHits", "memHit", "thinCtx",
 	"candLen", "atDot", "argPos", "learnHit", "modelProb",
-	"srcIdent",
+	"srcIdent", "impHit", "indentFit",
 }
 
 var featDim = len(featNames)
@@ -78,6 +78,12 @@ func featSrcIdx(src string) int {
 // itemFeat computes the fixed-order feature vector for a candidate in
 // its request context.
 func itemFeat(it *Item, scopeHits int, memHit, thinCtx, atDot, argPos, learnHit bool) []float32 {
+	return itemFeatExt(it, scopeHits, memHit, thinCtx, atDot, argPos, learnHit, false, false)
+}
+
+// itemFeatExt is itemFeat with the newer trailing features; the
+// fixed-order vector stays append-only for ranker compatibility.
+func itemFeatExt(it *Item, scopeHits int, memHit, thinCtx, atDot, argPos, learnHit, impHit, indentFit bool) []float32 {
 	f := make([]float32, featDim)
 	f[0] = 1
 	f[1] = float32(math.Log1p(math.Max(it.Score, 0)))
@@ -111,6 +117,12 @@ func itemFeat(it *Item, scopeHits int, memHit, thinCtx, atDot, argPos, learnHit 
 	// first line. Retrieval hits score high here too when they fit the
 	// context; adapt noise and stale variants score low.
 	f[21] = float32(math.Min(math.Max(it.modelP, 0), 1))
+	if impHit {
+		f[23] = 1
+	}
+	if indentFit {
+		f[24] = 1
+	}
 	return f
 }
 

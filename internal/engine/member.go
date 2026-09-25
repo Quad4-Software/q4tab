@@ -27,6 +27,7 @@ type facts struct {
 	alias map[string]string            // type A = B / type A B where B is a named type
 	ptr   map[string]bool              // vars whose declared type is a pointer: recv strips *
 	decls map[string]bool              // top-level declared names (var/const/type/func)
+	imps  map[string]bool              // imported module/package last segments
 }
 
 func newFacts() *facts {
@@ -40,6 +41,7 @@ func newFacts() *facts {
 		alias: map[string]string{},
 		ptr:   map[string]bool{},
 		decls: map[string]bool{},
+		imps:  map[string]bool{},
 	}
 }
 
@@ -96,6 +98,9 @@ func (f *facts) merge(o *facts) {
 	}
 	for d := range o.decls {
 		f.decls[d] = true
+	}
+	for k := range o.imps {
+		f.imps[k] = true
 	}
 }
 
@@ -234,6 +239,55 @@ func extractFactsToks(toks []string) *facts {
 				// Plain func: scan its parameter list for typed
 				// names so "w http.ResponseWriter" teaches w.
 				scanParams(toks, i, f)
+			}
+		case "import", "use", "require", "from":
+			// Record the last segment of each imported path: a file
+			// that imports encoding/json should rank json.* lines
+			// higher. Covers import "a/b", the import ( ... ) block
+			// spanning lines, from a.b import c, and use a::b::C.
+			depth := 0
+			for j := i + 1; j < len(toks); j++ {
+				s := toks[j]
+				if s == tokenize.NL && depth == 0 {
+					break
+				}
+				if s == "(" {
+					depth++
+					continue
+				}
+				if s == ")" {
+					if depth == 0 {
+						break
+					}
+					depth--
+					continue
+				}
+				if strings.TrimSpace(s) == "" {
+					continue
+				}
+				if strings.HasPrefix(s, "\"") || strings.HasPrefix(s, "'") {
+					seg := strings.Trim(s, "\"'`")
+					if k := strings.LastIndexAny(seg, "/\\."); k >= 0 {
+						seg = seg[k+1:]
+					}
+					if identTok(seg) {
+						f.imps[seg] = true
+					}
+					continue
+				}
+				// Dotted/qualified path: keep the trailing segment.
+				if identTok(s) && !tokenize.IsKeywordish(s) {
+					last := s
+					for strings.HasPrefix(atTok(toks, j+1), ".") ||
+						atTok(toks, j+1) == "::" {
+						j += 2
+						if nx := atTok(toks, j); identTok(nx) {
+							last = nx
+						}
+					}
+					f.imps[last] = true
+					continue
+				}
 			}
 		case "type":
 			j := nonWS(toks, i+1)

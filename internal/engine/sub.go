@@ -219,8 +219,16 @@ func (e *Engine) lineBiItems(text string, offset int, linePrefix string) []Item 
 		} else {
 			text = "\n" + indent + key
 		}
+		sc := e.w.LineBi * (1 + 0.2*float64(cnts[i]))
+		if !bol {
+			// Mid-line, this guesses the NEXT line - speculative,
+			// capped so it cannot outscore attested same-line text.
+			if sc > e.w.Dyn*1.5 {
+				sc = e.w.Dyn * 1.5
+			}
+		}
 		out = append(out, Item{Text: text, Source: "linebi",
-			Score: e.w.LineBi * (1 + 0.2*float64(cnts[i]))})
+			Score: sc})
 	}
 	return out
 }

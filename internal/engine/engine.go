@@ -153,21 +153,22 @@ type Engine struct {
 
 	// Auxiliary model layers from the v3 bundle. All optional; a nil
 	// field disables that layer cleanly.
-	lineBi     *lines.GramIndex            // previous line(s) -> next line
-	struc      *model.Order                // lexical-context -> token counts
-	langs      map[string]*model.LangTable // per-language low-order tables
-	sub        *model.Model                // identifier subtoken model
-	idents     *model.IdentIndex           // subtoken path -> ident ids
-	cal        *Calibrator                 // journal-trained rank calibrator
-	mli        *lines.MaskedIndex          // identifier-insensitive retrieval over Lines
-	fstarts    map[string][]string         // lang -> common first lines of a file
-	dirIds     map[string][]string         // dir -> top idents (dir cache + import adjacency)
-	dirSuf     map[string][]string         // path suffix -> dirs, for import resolution
-	tyMem      map[string][]string         // corpus type -> members (member memory)
-	callMem    map[string][]string         // corpus func -> member called on result
-	aux        atomic.Pointer[auxSnap]     // sidecar overlay: swappable corpus tables
-	sessFacts  *facts                      // merged member facts over open docs
-	sessBlocks map[string][]string         // merged line -> followers over open docs
+	lineBi       *lines.GramIndex                    // previous line(s) -> next line
+	struc        *model.Order                        // lexical-context -> token counts
+	langs        map[string]*model.LangTable         // per-language low-order tables
+	sub          *model.Model                        // identifier subtoken model
+	idents       *model.IdentIndex                   // subtoken path -> ident ids
+	cal          *Calibrator                         // journal-trained rank calibrator
+	mli          *lines.MaskedIndex                  // identifier-insensitive retrieval over Lines
+	fstarts      map[string][]string                 // lang -> common first lines of a file
+	dirIds       map[string][]string                 // dir -> top idents (dir cache + import adjacency)
+	dirSuf       map[string][]string                 // path suffix -> dirs, for import resolution
+	tyMem        map[string][]string                 // corpus type -> members (member memory)
+	callMem      map[string][]string                 // corpus func -> member called on result
+	aux          atomic.Pointer[auxSnap]             // sidecar overlay: swappable corpus tables
+	sessFacts    *facts                              // merged member facts over open docs
+	sessBlocks   map[string][]string                 // merged line -> followers over open docs
+	sessLinePool atomic.Pointer[map[string][]string] // per-lang lines for infix match
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -180,6 +181,7 @@ type Engine struct {
 	shmu     sync.Mutex
 	jmu      sync.Mutex
 	shown    map[uint64]shownEnt
+	rejected map[uint64]rejEnt // shapes demoted on re-request at a site
 	shownN   map[string]int
 	accN     map[string]int
 	rejN     map[string]int
@@ -221,6 +223,14 @@ type shownEnt struct {
 	at         time.Time
 }
 
+// rejEnt remembers the masked shapes rejected at a (doc, line) site
+// so a re-request does not re-offer the same wrong answer. Bounded
+// map: keys churn with editing.
+type rejEnt struct {
+	shapes []string
+	at     time.Time
+}
+
 func New(cfg Config) *Engine {
 	return &Engine{
 		cfg:      cfg,
@@ -231,6 +241,7 @@ func New(cfg Config) *Engine {
 		session:  model.NewCache(cfg.CacheOrdr),
 		learned:  model.NewCache(cfg.CacheOrdr),
 		shown:    make(map[uint64]shownEnt),
+		rejected: make(map[uint64]rejEnt),
 		shownN:   make(map[string]int),
 		accN:     make(map[string]int),
 		rejN:     make(map[string]int),
@@ -583,6 +594,7 @@ func (e *Engine) recordAccept(uri, text string, line int) {
 		return
 	}
 	completed := lines.Normalize(firstLineOf(text))
+	var rejShapes []string
 	for i, it := range se.items {
 		if lines.Normalize(se.linePrefix+firstLineOf(it.Text)) == completed {
 			e.shmu.Lock()
@@ -597,6 +609,7 @@ func (e *Engine) recordAccept(uri, text string, line int) {
 			}
 			e.journalEventLocked("a", it, i)
 		} else {
+			rejShapes = append(rejShapes, lines.MaskedLine(lines.Normalize(firstLineOf(it.Text))))
 			e.shmu.Lock()
 			e.rejN[baseSource(it.Source)]++
 			e.shmu.Unlock()
@@ -605,6 +618,14 @@ func (e *Engine) recordAccept(uri, text string, line int) {
 			}
 			e.journalEventLocked("r", it, i)
 		}
+	}
+	if len(rejShapes) > 0 {
+		e.shmu.Lock()
+		if len(e.rejected) > 1024 {
+			e.rejected = make(map[uint64]rejEnt)
+		}
+		e.rejected[key] = rejEnt{rejShapes, time.Now()}
+		e.shmu.Unlock()
 	}
 	if e.ranker != nil {
 		e.ranker.saveIfDirty(e.rankPath)
@@ -628,12 +649,20 @@ func (e *Engine) Reject(uri string, line int) {
 	if !ok {
 		return
 	}
+	rejShapes := make([]string, 0, len(se.items))
 	for i, it := range se.items {
+		rejShapes = append(rejShapes, lines.MaskedLine(lines.Normalize(firstLineOf(it.Text))))
 		if e.ranker != nil {
 			e.ranker.update(it.feat, false)
 		}
 		e.journalEventLocked("r", it, i)
 	}
+	e.shmu.Lock()
+	if len(e.rejected) > 1024 {
+		e.rejected = make(map[uint64]rejEnt)
+	}
+	e.rejected[key] = rejEnt{rejShapes, time.Now()}
+	e.shmu.Unlock()
 	if e.ranker != nil {
 		e.ranker.saveIfDirty(e.rankPath)
 	}
@@ -1189,6 +1218,39 @@ func (e *Engine) drainOnce() bool {
 	}
 	e.mu.Unlock()
 
+	// A flat per-lang line pool for infix matching: the line indexes
+	// key on line starts, so a pattern typed mid-line (the key in
+	// map[string]any{ inside a call) needs substring search over raw
+	// lines. Delta gets a smaller slice so open docs dominate.
+	pool := map[string][]string{}
+	poolAdd := func(lg string, ls []string, cap int) {
+		if len(ls) > cap {
+			ls = ls[len(ls)-cap:]
+		}
+		pool[lg] = append(pool[lg], ls...)
+		if len(pool[lg]) > 8192 {
+			pool[lg] = pool[lg][len(pool[lg])-8192:]
+		}
+	}
+	e.mu.RLock()
+	for lg, ls := range e.deltaByLang {
+		poolAdd(lg, ls, 4096)
+	}
+	for lg, ls := range e.learnByLang {
+		poolAdd(lg, ls, 4096)
+	}
+	e.mu.RUnlock()
+	e.docs.Range(func(_, v any) bool {
+		d := v.(*doc)
+		d.mu.Lock()
+		if len(d.lines) > 0 {
+			poolAdd(d.lang, d.lines, 8192)
+		}
+		d.mu.Unlock()
+		return true
+	})
+	e.sessLinePool.Store(&pool)
+
 	for _, a := range adds {
 		a.c.Add(a.ids, e.eofID)
 	}
@@ -1297,6 +1359,8 @@ type Item struct {
 	scopeHits int
 	memHit    bool
 	learnHit  bool
+	impHit    bool    // touches an imported module alias
+	indentFit bool    // first-line indent matches the cursor's
 	modelP    float64 // mean per-token n-gram probability of the first line
 }
 
@@ -1590,6 +1654,37 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					}
 				}
 			}
+			// Infix continuation, same file: the expression tail of
+			// the prefix matched inside a longer line. This is how
+			// "map[string]any{" mid-line finds the literal written
+			// inside an earlier writeJSON call. The needle scales
+			// with its length: a 15-char tail is a strong match.
+			if tail := infixTail(linePrefix); tail != "" {
+				sp := 1 + math.Min(float64(len(tail))/12, 1.5)
+				for _, c := range infixLines(docLines(text), tail, exclude, 3, false) {
+					if ok := e.accept(c, ns, restN); ok && !seen[c] {
+						seen[c] = true
+						localHit = true
+						items = append(items, mk(c, "file+infix", w.File*sp))
+					}
+				}
+			}
+		}
+		// Infix continuation across the session pool; independent of
+		// the current doc's size guard.
+		if tail := infixTail(linePrefix); tail != "" {
+			sp := 1 + math.Min(float64(len(tail))/12, 1.5)
+			if pool := e.sessLinePool.Load(); pool != nil {
+				for _, lg := range []string{lang, "", "other"} {
+					for _, c := range infixLines((*pool)[lg], tail, exclude, 3, true) {
+						if ok := e.accept(c, ns, restN); ok && !seen[c] {
+							seen[c] = true
+							localHit = true
+							items = append(items, mk(c, "sess+infix", w.Dyn*sp))
+						}
+					}
+				}
+			}
 		}
 
 		// Dynamic overlay: lines from other open documents and learned
@@ -1775,9 +1870,14 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 				v.Text = it.Text + "\n" + indent + e.li.Key(int(toks[0]))
 				v.Score = it.Score*0.5 + w.LineBi*0.5*float64(cnts[0])/float64(tot)
 				// A speculative second line must not outrank the
-				// confirmed first line it grew from.
+				// confirmed first line it grew from, and the whole
+				// iter family is capped at session strength: a corpus
+				// bigram is a guess, not attested text.
 				if v.Score > it.Score*0.9 {
 					v.Score = it.Score * 0.9
+				}
+				if v.Score > w.Dyn*2 {
+					v.Score = w.Dyn * 2
 				}
 				v.Source = it.Source + "+iter"
 				if e.accept(v.Text, ns, restN) && !seen[v.Text] {
@@ -1815,6 +1915,8 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		// "f(...)." call receivers and argument-position synthesis
 		// (error sentinels, the file's own literals).
 		var memNames map[string]bool
+		var pf *facts
+		lineIndent := leadingWS(linePrefix)
 		if dis&fMem == 0 {
 			pstart := 0
 			if len(prefix) > 96<<10 {
@@ -1823,7 +1925,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					pstart++
 				}
 			}
-			pf := extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
+			pf = extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
 			chain, call, indexed, isDot := dotChain(linePrefix)
 			var mems []string
 			var memLocal map[string]bool
@@ -2014,6 +2116,50 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					break
 				}
 			}
+			// Import-aware boost: the file imported "encoding/json",
+			// so a candidate touching json. is likelier than one
+			// touching a module the file never imports.
+			if pf != nil || e.sessFacts != nil {
+				impBreak := false
+				for _, f := range []*facts{pf, e.sessFacts} {
+					if f == nil || impBreak {
+						continue
+					}
+					for imp := range f.imps {
+						if strings.Contains(it.Text, imp+".") {
+							it.Score *= 1.15
+							it.impHit = true
+							it.Source = it.Source + "+imp"
+							impBreak = true
+							break
+						}
+					}
+				}
+			}
+			// Indent fit: the first suggested line at the same depth
+			// as the cursor line is likelier to be the local shape.
+			if ci := leadingWS(it.Text); ci != "" || lineIndent != "" {
+				if strings.HasPrefix(it.Text, lineIndent) {
+					it.Score *= 1.06
+					it.indentFit = true
+				}
+			}
+			// Reject suppression: a shape the user just rejected at
+			// this exact site should not come back at full strength.
+			// 5-minute decay so a legit retry still surfaces.
+			e.shmu.Lock()
+			if re, ok := e.rejected[shownKey(uri, curLineIdx)]; ok &&
+				time.Since(re.at) < 5*time.Minute {
+				sh := lines.MaskedLine(lines.Normalize(firstLineOf(it.Text)))
+				for _, s := range re.shapes {
+					if s == sh {
+						it.Score *= 0.4
+						it.Source = it.Source + "+rej"
+						break
+					}
+				}
+			}
+			e.shmu.Unlock()
 			// Per-source acceptance learning: sources that the caller
 			// historically accepts earn a multiplier, sources mostly
 			// rejected lose one. Computed from the live counters.
@@ -2103,13 +2249,41 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		argPos := strings.HasSuffix(tp, "(") || strings.HasSuffix(tp, ",")
 		for i := range items {
 			it := &items[i]
-			it.feat = itemFeat(it, it.scopeHits, it.memHit, thin, atDot, argPos, it.learnHit)
+			it.feat = itemFeatExt(it, it.scopeHits, it.memHit, thin, atDot, argPos, it.learnHit, it.impHit, it.indentFit)
 			it.Score *= e.ranker.mult(it.feat)
 		}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
 	if dis&fMMR == 0 {
 		items = dedupeShapes(items, scope)
+	}
+	// Source diversity: when the whole list came from one family,
+	// promote the best alternative-source item into the tail slot so
+	// the picker always offers a second opinion.
+	if dis&fMMR == 0 && len(items) > e.cfg.MaxItems {
+		top := items[:e.cfg.MaxItems]
+		fam := baseSource(top[len(top)-1].Source)
+		sameFam := true
+		for _, it := range top {
+			if baseSource(it.Source) != fam {
+				sameFam = false
+				break
+			}
+		}
+		if sameFam {
+			for _, alt := range items[e.cfg.MaxItems:] {
+				if baseSource(alt.Source) == fam {
+					continue
+				}
+				// Only promote a near-peer; a far weaker alternative
+				// is just a worse slot.
+				if alt.Score > top[len(top)-1].Score*0.15 {
+					top[len(top)-1] = alt
+				}
+				break
+			}
+			items = top
+		}
 	}
 	if len(items) > e.cfg.MaxItems {
 		items = items[:e.cfg.MaxItems]
@@ -2404,6 +2578,60 @@ func fileLines(text, prefix, exclude string, curLine, limit int) []string {
 		order = order[:limit]
 	}
 	return order
+}
+
+// infixTail extracts the expression tail of the typed prefix: the
+// operand-shaped suffix after the last separator. "f(w, ok, map[a]b{"
+// tails at "map[a]b{", so a mid-line pattern can match lines where it
+// appears inside a longer statement.
+func infixTail(linePrefix string) string {
+	lp := strings.TrimRight(linePrefix, " \t")
+	// The needle is the operand-shaped run after the last hard
+	// separator: "f(w, ok, map[a]b{" tails at "map[a]b{".
+	cut := strings.LastIndexAny(lp, "(,=")
+	if cut < 0 {
+		return ""
+	}
+	tail := strings.TrimSpace(lp[cut+1:])
+	if len(tail) < 4 {
+		return ""
+	}
+	return lines.Normalize(tail)
+}
+
+// infixLines scans normalized lines for tail at a non-zero position
+// and emits the remainder. Complements the prefix indexes: a pattern
+// that only ever appears mid-statement still surfaces. rev scans the
+// tail of ls first: the session pool appends open-doc lines last, so
+// the user's own code answers before delta noise eats the limit.
+func infixLines(ls []string, tail, exclude string, limit int, rev bool) []string {
+	if len(tail) < 4 {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	n := len(ls)
+	for k := 0; k < n; k++ {
+		i := k
+		if rev {
+			i = n - 1 - k
+		}
+		l := ls[i]
+		idx := strings.Index(l, tail)
+		if idx <= 0 || l == exclude {
+			continue
+		}
+		rest := strings.TrimSpace(l[idx+len(tail):])
+		if rest == "" || seen[rest] {
+			continue
+		}
+		seen[rest] = true
+		out = append(out, rest)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 // fileAdaptLines is fileLines with identifier masking: lines whose

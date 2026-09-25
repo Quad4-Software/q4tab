@@ -696,3 +696,57 @@ func f(items []Entry, e *Entry) {
 		t.Fatalf("want *e) for ptr elem, got %v", texts(items))
 	}
 }
+
+func TestInfixContinuation(t *testing.T) {
+	// A pattern that only exists mid-line in another file must still
+	// surface: the key literal inside the earlier writeJSON call.
+	e := buildEngine(t, DefaultConfig())
+	e.UpdateDoc("file:///h.go", `package svc
+
+func a(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]any{"key": e.Key, "value": e.Value})
+}
+`)
+	e.Flush()
+	text := "package svc\n\nfunc b(w http.ResponseWriter) {\n\twriteJSON(w, http.StatusOK, map[string]any{"
+	items := e.Complete("file:///h2.go", text, len(text))
+	if !hasText(items, "\"key\": e.Key, \"value\": e.Value})") {
+		t.Fatalf("infix literal missing: %v", texts(items))
+	}
+}
+
+func TestImportBoost(t *testing.T) {
+	f := extractFactsToks(tokenize.Lex([]byte(`package svc
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+import "a.b.c"
+from x.y import z
+use std::collections::HashMap
+`)))
+	if !f.imps["json"] || !f.imps["http"] || !f.imps["c"] || !f.imps["z"] || !f.imps["HashMap"] {
+		t.Fatalf("imports missing: %v", f.imps)
+	}
+}
+
+func TestRejectSuppression(t *testing.T) {
+	e := buildEngine(t, DefaultConfig())
+	e.UpdateDoc("file:///rj.go", "package q\n\nfunc f() {\n\tvar alpha = 1\n\t_ = alp")
+	e.Flush()
+	line := 3
+	e.recordShown("file:///rj.go", line, "\t_ = alp", []Item{
+		{Text: "haJunk", Score: 9},
+		{Text: "haJunk2", Score: 8},
+	})
+	e.Reject("file:///rj.go", line)
+	// The rejected shapes are now remembered at this site.
+	e.shmu.Lock()
+	_, ok := e.rejected[shownKey("file:///rj.go", line)]
+	e.shmu.Unlock()
+	if !ok {
+		t.Fatal("rejected shapes not recorded")
+	}
+}
