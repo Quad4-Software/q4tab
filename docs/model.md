@@ -48,10 +48,17 @@ base until a full rebuild folds everything back.
 ## Aux sidecar
 
 `index -aux` walks the corpus extracting only the small tables -
-type members, call members, directory idents, file-start priors - and
-writes model.bin.aux (tens of MB, no spill). The server merges it at
-startup, so corpus-wide member memory works on cold files even when a
-full n-gram rebuild is not practical on the local disk budget.
+type members, call members, directory idents, file-start priors, and
+type aliases - and writes model.bin.aux (tens of MB, no spill). The
+file carries a versioned header with a file count and build
+timestamp.
+
+The aux is an overlay, not a merge: the base model's tables stay
+untouched and the sidecar sits beside them in lookup order. Running
+servers watch the file and hot-swap on change, the same contract as
+the delta overlay. `q4tab fetch <url|path>` downloads a sidecar,
+validates the format, and installs it atomically - so shipping
+corpus updates to clients is a 25MB download, not a retrain.
 
 ## Weight tuning
 

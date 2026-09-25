@@ -802,8 +802,9 @@ func scanStructFields(toks []string, open int, typ string, f *facts) int {
 // returns member continuations for it, session facts first.
 // chain is the dotted path before the trailing dot: "s.st." gives
 // ["s","st"], "st." gives ["st"]. Resolution order per step: doc
-// facts, then session facts, then corpus tables.
-func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map[string][]string) (mems []string, corpusOnly bool) {
+// facts, then session facts, then corpus tables. tyMems carries the
+// static tables: the base model plus any aux overlay, oldest first.
+func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[string][]string, auxAlias map[string]string) (mems []string, corpusOnly bool) {
 	if len(chain) == 0 {
 		return nil, false
 	}
@@ -846,9 +847,10 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map
 	if typ == "" {
 		return nil, false
 	}
-	// Alias chase: bounded, so alias loops terminate.
+	// Alias chase: bounded, so alias loops terminate. Facts cover the
+	// session; the aux overlay covers corpus aliases.
 	for hop := 0; hop < 4; hop++ {
-		nt := ""
+		nt := auxAlias[typ]
 		for _, f := range []*facts{doc, sess} {
 			if f != nil && f.alias[typ] != "" {
 				nt = f.alias[typ]
@@ -879,8 +881,10 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map
 				add(m)
 			}
 		}
-		for _, m := range tyMem[t] {
-			add(m)
+		for _, tab := range tyMems {
+			for _, m := range tab[t] {
+				add(m)
+			}
 		}
 	}
 	collect(typ)
@@ -902,8 +906,10 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMem, callM map
 					add(m)
 				}
 			}
-			for _, m := range tyMem[ft] {
-				add(m)
+			for _, tab := range tyMems {
+				for _, m := range tab[ft] {
+					add(m)
+				}
 			}
 		}
 	}
@@ -934,7 +940,7 @@ func sortMembers(mems []string) {
 // ahead of corpus counts. Declared result types fill the gap when
 // nothing in the corpus chains a member off the call: "NewQueue()."
 // resolves through "func NewQueue() *Queue" into Queue's members.
-func callMembers(name string, doc, sess *facts, tyMem, callM map[string][]string) []string {
+func callMembers(name string, doc, sess *facts, tyMems, callMs []map[string][]string) []string {
 	seen := map[string]bool{}
 	var out []string
 	addRaw := func(m string) {
@@ -954,8 +960,10 @@ func callMembers(name string, doc, sess *facts, tyMem, callM map[string][]string
 			add(m)
 		}
 	}
-	for _, m := range callM[name] {
-		add(strings.TrimSuffix(m, "("))
+	for _, tab := range callMs {
+		for _, m := range tab[name] {
+			add(strings.TrimSuffix(m, "("))
+		}
 	}
 	for _, f := range []*facts{doc, sess} {
 		if f == nil {
@@ -968,8 +976,10 @@ func callMembers(name string, doc, sess *facts, tyMem, callM map[string][]string
 		for m := range f.tyMem[rt] {
 			addRaw(m)
 		}
-		for _, m := range tyMem[rt] {
-			addRaw(m)
+		for _, tab := range tyMems {
+			for _, m := range tab[rt] {
+				addRaw(m)
+			}
 		}
 	}
 	return out
@@ -1158,6 +1168,7 @@ type factBuilder struct {
 	tyMem map[string]map[string]int // type -> member -> count
 	callM map[string]map[string]int // func -> member -> count
 	retT  map[string]string         // func -> declared result type
+	alias map[string]string         // type alias -> target type
 }
 
 func newFactBuilder() *factBuilder {
@@ -1165,6 +1176,7 @@ func newFactBuilder() *factBuilder {
 		tyMem: map[string]map[string]int{},
 		callM: map[string]map[string]int{},
 		retT:  map[string]string{},
+		alias: map[string]string{},
 	}
 }
 
@@ -1182,6 +1194,9 @@ func (fb *factBuilder) Add(toks []string) {
 	}
 	for fn, t := range f.retT {
 		fb.retT[fn] = t
+	}
+	for a, t := range f.alias {
+		fb.alias[a] = t
 	}
 	for fn, ms := range f.callM {
 		row := fb.callM[fn]

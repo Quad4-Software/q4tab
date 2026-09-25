@@ -165,6 +165,7 @@ type Engine struct {
 	dirSuf     map[string][]string         // path suffix -> dirs, for import resolution
 	tyMem      map[string][]string         // corpus type -> members (member memory)
 	callMem    map[string][]string         // corpus func -> member called on result
+	aux        atomic.Pointer[auxSnap]     // sidecar overlay: swappable corpus tables
 	sessFacts  *facts                      // merged member facts over open docs
 	sessBlocks map[string][]string         // merged line -> followers over open docs
 
@@ -912,6 +913,13 @@ func (e *Engine) Stats() map[string]any {
 		}
 		out["contexts"] = rows
 	}
+	if at, ac, ad, af, ab := e.AuxInfo(); af > 0 {
+		out["auxTypes"] = at
+		out["auxCalls"] = ac
+		out["auxDirs"] = ad
+		out["auxFiles"] = af
+		out["auxBuiltAt"] = ab
+	}
 	return out
 }
 
@@ -1482,7 +1490,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		var dirScope map[string]bool
 		if scope != nil {
 			for _, d := range e.resolveDirs(scopeCands) {
-				for _, s := range e.dirIds[d] {
+				for _, s := range e.dirIdents(d) {
 					if _, ok := scope[s]; !ok {
 						scope[s] = true
 						freq[s] = 1
@@ -1673,7 +1681,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		// Thin context: a fresh or nearly-empty file anchors nothing,
 		// so offer the language's conventional opening lines.
 		if thin && dis&fPrior == 0 {
-			for i, s := range e.fstarts[lang] {
+			for i, s := range e.fileStarts(lang) {
 				if i >= 4 {
 					break
 				}
@@ -1820,10 +1828,11 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			var mems []string
 			corpOnly := false
 			if isDot {
+				tyTabs, callTabs, auxAlias := e.memberTabs()
 				if call != "" {
-					mems = callMembers(call, pf, e.sessFacts, e.tyMem, e.callMem)
+					mems = callMembers(call, pf, e.sessFacts, tyTabs, callTabs)
 				} else {
-					mems, corpOnly = membersFor(chain, indexed, pf, e.sessFacts, e.tyMem, e.callMem)
+					mems, corpOnly = membersFor(chain, indexed, pf, e.sessFacts, tyTabs, auxAlias)
 				}
 				for _, m := range mems {
 					if ok := e.accept(m, ns, restN); ok && !seen[m] {
@@ -2556,7 +2565,7 @@ func (e *Engine) resolveDirs(cands []string) []string {
 	for i, c := range cands {
 		if i == 0 {
 			// Own directory: exact match only.
-			if _, ok := e.dirIds[c]; ok {
+			if len(e.dirIdents(c)) > 0 {
 				out = append(out, c)
 			}
 			continue

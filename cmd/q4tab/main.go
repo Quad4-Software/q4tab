@@ -17,6 +17,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,9 +108,9 @@ func loadEngine(cfg config) *engine.Engine {
 		return e
 	}
 	e.SetBundle(bun)
-	// The aux sidecar carries member/directory tables for corpus files
-	// the base model predates; entries the model already has win.
-	e.MergeAux(engine.LoadAux(defaultModelPath() + ".aux"))
+	// The aux sidecar overlays member/directory tables for corpus
+	// files the base model predates; it is swappable at runtime.
+	e.SetAux(engine.LoadAux(defaultModelPath() + ".aux"))
 	if delta, err := engine.LoadDelta(defaultModelPath() + ".delta"); err == nil {
 		e.InstallDelta(delta)
 	}
@@ -304,6 +305,7 @@ func main() {
 			MaxConc: *maxConc, Roots: roots,
 		}
 		go watchDelta(delta, e, log)
+		go watchAux(defaultModelPath()+".aux", e, log)
 		// Network modes: the model contains source code, so warn when
 		// the bind address is not loopback or auth is off.
 		errc := make(chan error, 2)
@@ -552,6 +554,22 @@ func main() {
 		e := loadEngine(loadConfig())
 		for _, s := range e.LookupSymbol(fs.Arg(0), *limit) {
 			fmt.Printf("%s:%d\t%s\t%s\n", s.Path, s.Line, s.Kind, s.Sig)
+		}
+
+	case "fetch":
+		// Download an aux sidecar (or any model sidecar) and install
+		// it atomically. A running server picks it up via watchAux.
+		fs := flag.NewFlagSet("fetch", flag.ExitOnError)
+		out := fs.String("o", defaultModelPath()+".aux", "destination path")
+		timeout := fs.Duration("timeout", 120*time.Second, "download timeout")
+		fs.Parse(os.Args[2:])
+		if fs.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "usage: q4tab fetch [-o path] <url|file>")
+			os.Exit(2)
+		}
+		if err := fetchAux(fs.Arg(0), *out, *timeout, log); err != nil {
+			log("fetch: %v", err)
+			os.Exit(1)
 		}
 
 	case "stats":
@@ -1066,6 +1084,40 @@ func watchDelta(path string, e *engine.Engine, log func(string, ...any)) {
 	}
 }
 
+// watchAux reloads the aux sidecar whenever it changes, the same
+// contract as watchDelta: fetch or rebuild the file and the running
+// server picks it up without a restart.
+func watchAux(path string, e *engine.Engine, log func(string, ...any)) {
+	var lastMtime, lastSize int64
+	if st, err := os.Stat(path); err == nil {
+		lastMtime, lastSize = st.ModTime().UnixNano(), st.Size()
+	}
+	for {
+		time.Sleep(2 * time.Second)
+		st, err := os.Stat(path)
+		var mt, sz int64
+		if err == nil {
+			mt, sz = st.ModTime().UnixNano(), st.Size()
+		}
+		if mt == lastMtime && sz == lastSize {
+			continue
+		}
+		lastMtime, lastSize = mt, sz
+		if err != nil {
+			e.SetAux(nil)
+			log("watch: aux sidecar removed")
+			continue
+		}
+		a := engine.LoadAux(path)
+		if a == nil {
+			continue // mid-write or corrupt; try again next tick
+		}
+		e.SetAux(a)
+		log("watch: installed aux (%d types, %d calls, %d files)",
+			len(a.TypeMem), len(a.CallMem), a.Files)
+	}
+}
+
 func collectOrg(org, dest string, maxKB int) error {
 	out, err := exec.Command("gh", "repo", "list", org,
 		"--limit", "500", "--json", "name,size,isFork").Output()
@@ -1100,5 +1152,54 @@ func collectOrg(org, dest string, maxKB int) error {
 		cmd.Stderr = os.Stderr
 		cmd.Run() // continue past failures
 	}
+	return nil
+}
+
+// fetchAux downloads an aux sidecar from a URL (or copies a local
+// path), validates the format, and installs it atomically. The size
+// is capped at 512MB: aux tables are tens of MB, anything larger is
+// not an aux file.
+func fetchAux(src, dest string, timeout time.Duration, log func(string, ...any)) error {
+	var data []byte
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		cl := &http.Client{Timeout: timeout}
+		resp, err := cl.Get(src)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("%s: HTTP %d", src, resp.StatusCode)
+		}
+		data, err = io.ReadAll(io.LimitReader(resp.Body, 512<<20+1))
+		if err != nil {
+			return err
+		}
+		if len(data) > 512<<20 {
+			return fmt.Errorf("%s: too large for an aux sidecar", src)
+		}
+	} else {
+		var err error
+		data, err = os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+	}
+	// Validate before touching the destination: parse a copy.
+	tmp := dest + ".fetch"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	a := engine.LoadAux(tmp)
+	if a == nil {
+		os.Remove(tmp)
+		return fmt.Errorf("%s: not a valid aux sidecar", src)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	log("fetch: installed %s (%d types, %d calls, %d dirs, %d files)",
+		dest, len(a.TypeMem), len(a.CallMem), len(a.DirIdents), a.Files)
 	return nil
 }

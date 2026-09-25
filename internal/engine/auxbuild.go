@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"q4tab/internal/corpus"
 	"q4tab/internal/tokenize"
@@ -25,6 +26,9 @@ type AuxData struct {
 	CallMem    map[string][]string
 	DirIdents  map[string][]string
 	FileStarts map[string][]string
+	Aliases    map[string]string // type A = B across the corpus
+	Files      int               // corpus files the build covered
+	BuiltAt    int64             // unix seconds; freshness marker
 }
 
 // BuildAux extracts the aux tables over roots. Progress lines match
@@ -55,12 +59,19 @@ func BuildAux(roots []string, progress io.Writer) (*AuxData, error) {
 		CallMem:    callMem,
 		DirIdents:  dirs.Compact(96, 3),
 		FileStarts: starts.Compact(8, 3),
+		Aliases:    fb.alias,
+		Files:      files,
+		BuiltAt:    time.Now().Unix(),
 	}, nil
 }
 
+// auxMagic versions the sidecar format; the trailing byte is the
+// layout version so future tables can append without breaking old
+// readers (they stop at the version they know).
 const auxMagic = "Q4AUX1"
 
-// SaveAux writes the aux sidecar atomically: four string tables.
+// SaveAux writes the aux sidecar atomically: header (files, build
+// time), then the string tables.
 func SaveAux(path string, a *AuxData) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -69,10 +80,18 @@ func SaveAux(path string, a *AuxData) error {
 	}
 	w := &countingWriter{w: bufio.NewWriterSize(f, 1<<20)}
 	w.Write([]byte(auxMagic))
+	putU32(w, uint32(a.Files))
+	putU64(w, uint64(a.BuiltAt))
 	putStrTable(w, a.TypeMem)
 	putStrTable(w, a.CallMem)
 	putStrTable(w, a.DirIdents)
 	putStrTable(w, a.FileStarts)
+	// Aliases ride the strtable encoding as singleton lists.
+	al := make(map[string][]string, len(a.Aliases))
+	for k, v := range a.Aliases {
+		al[k] = []string{v}
+	}
+	putStrTable(w, al)
 	if err := w.w.(*bufio.Writer).Flush(); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -98,10 +117,18 @@ func LoadAux(path string) *AuxData {
 	}
 	r := &reader{b: data[len(auxMagic):]}
 	a := &AuxData{
+		Files:      int(r.u32()),
+		BuiltAt:    int64(r.u64()),
 		TypeMem:    readStrTable(r, "type-member"),
 		CallMem:    readStrTable(r, "call-member"),
 		DirIdents:  readStrTable(r, "dir-idents"),
 		FileStarts: readStrTable(r, "file-starts"),
+		Aliases:    map[string]string{},
+	}
+	for k, vs := range readStrTable(r, "alias") {
+		if len(vs) > 0 {
+			a.Aliases[k] = vs[0]
+		}
 	}
 	if r.err != nil {
 		return nil
@@ -109,34 +136,81 @@ func LoadAux(path string) *AuxData {
 	return a
 }
 
-// MergeAux folds an aux sidecar into the live tables. Existing
-// entries keep their values; aux entries extend coverage for files
-// the base model never saw.
-func (e *Engine) MergeAux(a *AuxData) {
+// auxSnap is the immutable aux layer: the base model's tables stay
+// untouched so a fresh sidecar can hot-swap without a server restart.
+type auxSnap struct {
+	tyMem   map[string][]string
+	callM   map[string][]string
+	dirIds  map[string][]string
+	fstarts map[string][]string
+	alias   map[string]string
+	files   int
+	builtAt int64
+}
+
+// SetAux installs or replaces the aux overlay. Nil clears it.
+func (e *Engine) SetAux(a *AuxData) {
 	if a == nil {
+		e.aux.Store(nil)
 		return
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	mergeInto := func(dst map[string][]string, src map[string][]string) map[string][]string {
-		if len(src) == 0 {
-			return dst
-		}
-		if dst == nil {
-			dst = map[string][]string{}
-		}
-		for k, vs := range src {
-			if len(dst[k]) == 0 {
-				dst[k] = append([]string(nil), vs...)
-			}
-		}
-		return dst
+	e.aux.Store(&auxSnap{
+		tyMem:   a.TypeMem,
+		callM:   a.CallMem,
+		dirIds:  a.DirIdents,
+		fstarts: a.FileStarts,
+		alias:   a.Aliases,
+		files:   a.Files,
+		builtAt: a.BuiltAt,
+	})
+}
+
+// AuxInfo reports the installed overlay for status endpoints.
+func (e *Engine) AuxInfo() (types, calls, dirs, files int, builtAt int64) {
+	if a := e.aux.Load(); a != nil {
+		return len(a.tyMem), len(a.callM), len(a.dirIds), a.files, a.builtAt
 	}
-	e.tyMem = mergeInto(e.tyMem, a.TypeMem)
-	e.callMem = mergeInto(e.callMem, a.CallMem)
-	if len(a.DirIdents) > 0 {
-		e.dirIds = mergeInto(e.dirIds, a.DirIdents)
-		e.dirSuf = buildDirSuf(e.dirIds)
+	return 0, 0, 0, 0, 0
+}
+
+// memberTabs returns the static member tables in lookup order:
+// the aux overlay first (it is the freshest), then the base model.
+func (e *Engine) memberTabs() (ty, call []map[string][]string, alias map[string]string) {
+	if a := e.aux.Load(); a != nil {
+		if len(a.tyMem) > 0 {
+			ty = append(ty, a.tyMem)
+		}
+		if len(a.callM) > 0 {
+			call = append(call, a.callM)
+		}
+		alias = a.alias
 	}
-	e.fstarts = mergeInto(e.fstarts, a.FileStarts)
+	if len(e.tyMem) > 0 {
+		ty = append(ty, e.tyMem)
+	}
+	if len(e.callMem) > 0 {
+		call = append(call, e.callMem)
+	}
+	return ty, call, alias
+}
+
+// dirIdents returns dir ids from the aux overlay, falling back to
+// the base model's table.
+func (e *Engine) dirIdents(dir string) []string {
+	if a := e.aux.Load(); a != nil {
+		if ids := a.dirIds[dir]; len(ids) > 0 {
+			return ids
+		}
+	}
+	return e.dirIds[dir]
+}
+
+// fileStarts returns first-line priors for lang, aux overlay first.
+func (e *Engine) fileStarts(lang string) []string {
+	if a := e.aux.Load(); a != nil {
+		if fs := a.fstarts[lang]; len(fs) > 0 {
+			return fs
+		}
+	}
+	return e.fstarts[lang]
 }
