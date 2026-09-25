@@ -11,6 +11,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -562,12 +563,13 @@ func main() {
 		fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 		out := fs.String("o", defaultModelPath()+".aux", "destination path")
 		timeout := fs.Duration("timeout", 120*time.Second, "download timeout")
+		sum := fs.String("sha256", "", "expected sha256 of the payload (hex); empty skips the check")
 		fs.Parse(os.Args[2:])
 		if fs.NArg() < 1 {
-			fmt.Fprintln(os.Stderr, "usage: q4tab fetch [-o path] <url|file>")
+			fmt.Fprintln(os.Stderr, "usage: q4tab fetch [-o path] [-sha256 hex] <url|file>")
 			os.Exit(2)
 		}
-		if err := fetchAux(fs.Arg(0), *out, *timeout, log); err != nil {
+		if err := fetchAux(fs.Arg(0), *out, *sum, *timeout, log); err != nil {
 			log("fetch: %v", err)
 			os.Exit(1)
 		}
@@ -1159,7 +1161,7 @@ func collectOrg(org, dest string, maxKB int) error {
 // path), validates the format, and installs it atomically. The size
 // is capped at 512MB: aux tables are tens of MB, anything larger is
 // not an aux file.
-func fetchAux(src, dest string, timeout time.Duration, log func(string, ...any)) error {
+func fetchAux(src, dest, wantSHA string, timeout time.Duration, log func(string, ...any)) error {
 	var data []byte
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		cl := &http.Client{Timeout: timeout}
@@ -1183,6 +1185,12 @@ func fetchAux(src, dest string, timeout time.Duration, log func(string, ...any))
 		data, err = os.ReadFile(src)
 		if err != nil {
 			return err
+		}
+	}
+	if wantSHA != "" {
+		got := fmt.Sprintf("%x", sha256.Sum256(data))
+		if !strings.EqualFold(got, wantSHA) {
+			return fmt.Errorf("sha256 mismatch: got %s want %s", got, wantSHA)
 		}
 	}
 	// Validate before touching the destination: parse a copy.
