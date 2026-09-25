@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,6 +81,7 @@ type config struct {
 	Roots    []string `json:"roots"`
 	Order    int      `json:"order"`
 	MaxLines int      `json:"maxLines"`
+	MemMode  string   `json:"mem"` // auto | low | max
 }
 
 func loadConfig() config {
@@ -97,10 +99,41 @@ func loadConfig() config {
 	return cfg
 }
 
+// memMode resolves the memory profile: config file, then Q4TAB_MEM,
+// then a flag override. auto keeps bounded caches and lets the kernel
+// manage mapped pages; low bounds caches tighter, tightens GC, and
+// sweeps mapped pages back to disk on a timer; max keeps everything
+// resident and unbounded.
+func memMode(cfg config, flag string) string {
+	m := cfg.MemMode
+	if v := os.Getenv("Q4TAB_MEM"); v != "" {
+		m = v
+	}
+	if flag != "" {
+		m = flag
+	}
+	switch m {
+	case "", "auto":
+		return "auto"
+	case "low", "max":
+		return m
+	}
+	return "auto"
+}
+
 func loadEngine(cfg config) *engine.Engine {
 	ecfg := engine.DefaultConfig()
 	if cfg.MaxLines > 0 {
 		ecfg.MaxLines = cfg.MaxLines
+	}
+	switch memMode(cfg, "") {
+	case "low":
+		// 256k context rows is roughly 30-60MB per cache once warm,
+		// versus unbounded growth to ~350MB.
+		ecfg.CacheRows = 1 << 18
+		debug.SetGCPercent(60)
+	case "max":
+		ecfg.CacheRows = 0
 	}
 	e := engine.New(ecfg)
 	bun, err := engine.Load(defaultModelPath())
@@ -285,12 +318,29 @@ func main() {
 		rate := fs.Float64("rate", 0, "sustained requests/sec per client IP (0 = unlimited)")
 		burst := fs.Int("burst", 0, "rate-limit burst (default 4x rate)")
 		maxConc := fs.Int("maxconc", 256, "max concurrent HTTP requests")
+		mem := fs.String("mem", "", "memory profile: auto | low | max (or Q4TAB_MEM / config mem)")
 		var roots multiFlag
 		fs.Var(&roots, "root", "corpus root allowed for MCP path reads (repeatable; unset = path reads disabled over HTTP)")
 		fs.Parse(os.Args[2:])
 		cfg := loadConfig()
+		mode := memMode(cfg, *mem)
 		e := loadEngine(cfg)
 		delta := defaultModelPath() + ".delta"
+		if mode == "low" {
+			// Return heap and mapped pages to the OS on a timer: Go
+			// holds freed heap lazily otherwise, and mapped model
+			// pages stay resident until real pressure. NVMe re-fault
+			// is cheap, so this is a good trade on small boxes.
+			go func() {
+				for range time.Tick(3 * time.Minute) {
+					debug.FreeOSMemory()
+					e.SweepPages()
+				}
+			}()
+			log("mem profile: low (bounded caches, tighter GC, page sweeps)")
+		} else if mode == "max" {
+			log("mem profile: max (unbounded caches, no sweeps)")
+		}
 		if *listen == "" && *httpAddr == "" {
 			conn := lsp.NewConn(os.Stdin, os.Stdout)
 			srv := lsp.NewServer(e, conn)

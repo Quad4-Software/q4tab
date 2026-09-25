@@ -55,6 +55,10 @@ type Bundle struct {
 	// on its result: NewDecoder -> Decode, NewEncoder -> Encode.
 	// Powers completion at "f(...)." call receivers.
 	CallMem map[string][]string
+	// Raw is the mapped file buffer when the model loaded via mmap.
+	// Kept so a memory-pressure sweep can madvise pages back to disk.
+	// Nil for ReadFile loads.
+	Raw []byte
 }
 
 // LangOf classifies a path or URI into a language bucket. Extensions

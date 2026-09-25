@@ -26,9 +26,11 @@ type AuxData struct {
 	CallMem    map[string][]string
 	DirIdents  map[string][]string
 	FileStarts map[string][]string
-	Aliases    map[string]string // type A = B across the corpus
-	Files      int               // corpus files the build covered
-	BuiltAt    int64             // unix seconds; freshness marker
+	Aliases    map[string]string   // type A = B across the corpus
+	RetT       map[string]string   // func name -> declared result type
+	SigT       map[string][]string // func name -> ordered param types
+	Files      int                 // corpus files the build covered
+	BuiltAt    int64               // unix seconds; freshness marker
 }
 
 // BuildAux extracts the aux tables over roots. Progress lines match
@@ -60,6 +62,8 @@ func BuildAux(roots []string, progress io.Writer) (*AuxData, error) {
 		DirIdents:  dirs.Compact(96, 3),
 		FileStarts: starts.Compact(8, 3),
 		Aliases:    fb.alias,
+		RetT:       fb.retT,
+		SigT:       fb.sigT,
 		Files:      files,
 		BuiltAt:    time.Now().Unix(),
 	}, nil
@@ -86,12 +90,19 @@ func SaveAux(path string, a *AuxData) error {
 	putStrTable(w, a.CallMem)
 	putStrTable(w, a.DirIdents)
 	putStrTable(w, a.FileStarts)
-	// Aliases ride the strtable encoding as singleton lists.
+	// Aliases and retT ride the strtable encoding as singleton lists;
+	// sigT is already list-valued.
 	al := make(map[string][]string, len(a.Aliases))
 	for k, v := range a.Aliases {
 		al[k] = []string{v}
 	}
 	putStrTable(w, al)
+	rt := make(map[string][]string, len(a.RetT))
+	for k, v := range a.RetT {
+		rt[k] = []string{v}
+	}
+	putStrTable(w, rt)
+	putStrTable(w, a.SigT)
 	if err := w.w.(*bufio.Writer).Flush(); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -130,8 +141,28 @@ func LoadAux(path string) *AuxData {
 			a.Aliases[k] = vs[0]
 		}
 	}
-	if r.err != nil {
-		return nil
+	a.RetT = map[string]string{}
+	// Trailing tables are optional in both directions: absent from
+	// old sidecars, and salvageable when present-but-corrupt - the
+	// core member tables stand on their own.
+	if r.off+4 <= len(r.b) {
+		mark := r.off
+		for k, vs := range readStrTable(r, "rett") {
+			if len(vs) > 0 {
+				a.RetT[k] = vs[0]
+			}
+		}
+		if r.err != nil {
+			r.err = nil
+			r.off = mark
+		}
+	}
+	if r.err == nil && r.off+4 <= len(r.b) {
+		a.SigT = readStrTable(r, "sigt")
+		if r.err != nil {
+			r.err = nil
+			a.SigT = nil
+		}
 	}
 	return a
 }
@@ -144,6 +175,8 @@ type auxSnap struct {
 	dirIds  map[string][]string
 	fstarts map[string][]string
 	alias   map[string]string
+	retT    map[string]string
+	sigT    map[string][]string
 	files   int
 	builtAt int64
 }
@@ -160,6 +193,8 @@ func (e *Engine) SetAux(a *AuxData) {
 		dirIds:  a.DirIdents,
 		fstarts: a.FileStarts,
 		alias:   a.Aliases,
+		retT:    a.RetT,
+		sigT:    a.SigT,
 		files:   a.Files,
 		builtAt: a.BuiltAt,
 	})

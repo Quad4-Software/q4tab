@@ -30,3 +30,7 @@ func mapFile(path string) (data []byte, mapped bool, err error) {
 	}
 	return b, true, nil
 }
+
+func madviseDontNeed(b []byte) {
+	syscall.Madvise(b, syscall.MADV_DONTNEED)
+}

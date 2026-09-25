@@ -129,3 +129,17 @@ only twins, source diversity promotes a near-peer alternative into the
 tail slot when one family sweeps the list, and next-line guesses from
 the corpus bigram are capped at session strength when the cursor is
 mid-line so speculative continuations cannot outrank attested text.
+
+## Type-directed assembly (synth)
+
+When the cursor position demands a knowable type - var decl,
+assignment, return, call-argument slot, struct literal field - the
+engine composes the expression instead of predicting tokens.
+Producers: in-scope vars (with pointer adapts), factory functions
+whose declared result is the goal, field paths that reach it, vars
+whose method set satisfies an interface goal, and zero values.
+Signatures (func -> ordered param types, Type.Method keyed) let the
+arg filler bind scope vars by type, so NewStore(ttl int) emits
+NewStore(timeout) when timeout is the int in scope. Session facts
+feed local producers first; corpus signature and result tables ship
+in the aux sidecar for cold files, ranked below local producers.

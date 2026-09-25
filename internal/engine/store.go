@@ -454,6 +454,9 @@ func Load(path string) (*Bundle, error) {
 		return nil, fmt.Errorf("model: truncated line index header")
 	}
 	bun := &Bundle{M: m}
+	if mapped {
+		bun.Raw = data
+	}
 	if nl > 0 {
 		loff := r.u32s(nl + 1)
 		lcnts := r.i32s(nl)
@@ -733,6 +736,9 @@ func loadV12(r *reader, data []byte, mapped bool) (*Bundle, error) {
 		return nil, fmt.Errorf("model: truncated line index header")
 	}
 	bun := &Bundle{M: m}
+	if mapped {
+		bun.Raw = data
+	}
 	if nl > 0 {
 		loff := r.u32s(nl + 1)
 		lcnts := r.i32s(nl)

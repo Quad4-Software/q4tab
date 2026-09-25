@@ -27,7 +27,7 @@ var featNames = []string{
 	"srcMem", "srcLineBi", "srcPrior", "srcIter", "srcUnit", "srcEdit",
 	"multiLine", "scopeHits", "memHit", "thinCtx",
 	"candLen", "atDot", "argPos", "learnHit", "modelProb",
-	"srcIdent", "impHit", "indentFit",
+	"srcIdent", "impHit", "indentFit", "srcSynth",
 }
 
 var featDim = len(featNames)
@@ -71,6 +71,8 @@ func featSrcIdx(src string) int {
 		return 12
 	case "ident":
 		return 22
+	case "synth":
+		return 25
 	}
 	return -1
 }

@@ -34,3 +34,9 @@ func mapFile(path string) (data []byte, mapped bool, err error) {
 	syscall.Madvise(b, syscall.MADV_RANDOM)
 	return b, true, nil
 }
+
+// madviseDontNeed drops file-backed pages so they return to the page
+// cache. Next access faults them back from disk - cheap on NVMe.
+func madviseDontNeed(b []byte) {
+	syscall.Madvise(b, syscall.MADV_DONTNEED)
+}

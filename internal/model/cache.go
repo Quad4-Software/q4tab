@@ -17,6 +17,8 @@ import (
 type Cache struct {
 	mu     sync.RWMutex
 	order  int
+	cap    int                            // max ctx rows across orders; 0 = unbounded
+	n      int                            // approximate live ctx rows
 	rows   []map[uint64]map[uint32]uint32 // index k: ctx(k-1 toks) -> tok -> count
 	totals []map[uint64]uint32
 }
@@ -30,6 +32,14 @@ func NewCache(order int) *Cache {
 		c.totals[i] = make(map[uint64]uint32)
 	}
 	return c
+}
+
+// SetCap bounds the cache. A locality cache tolerates reset well:
+// when the cap is hit the table clears and refills from current work.
+func (c *Cache) SetCap(n int) {
+	c.mu.Lock()
+	c.cap = n
+	c.mu.Unlock()
 }
 
 // Add counts n-grams in the token sequence. eofTok contexts are skipped.
@@ -60,13 +70,28 @@ func (c *Cache) Add(ids []uint32, eofTok uint32) {
 			h := hashCtx(ctx)
 			row := c.rows[k][h]
 			if row == nil {
+				if c.cap > 0 && c.n >= c.cap {
+					c.reset()
+					return
+				}
 				row = make(map[uint32]uint32, 1)
 				c.rows[k][h] = row
+				c.n++
 			}
 			row[tok]++
 			c.totals[k][h]++
 		}
 	}
+}
+
+// reset clears all rows. Called under the write lock when the cap
+// trips; the current document is re-Added by callers on next update.
+func (c *Cache) reset() {
+	for i := range c.rows {
+		clear(c.rows[i])
+		clear(c.totals[i])
+	}
+	c.n = 0
 }
 
 // Dist returns the interpolated cache distribution row for ctx at the

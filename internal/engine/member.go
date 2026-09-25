@@ -28,6 +28,7 @@ type facts struct {
 	ptr   map[string]bool              // vars whose declared type is a pointer: recv strips *
 	decls map[string]bool              // top-level declared names (var/const/type/func)
 	imps  map[string]bool              // imported module/package last segments
+	sigT  map[string][]string          // func name -> ordered param types ("" when unknown)
 }
 
 func newFacts() *facts {
@@ -42,6 +43,7 @@ func newFacts() *facts {
 		ptr:   map[string]bool{},
 		decls: map[string]bool{},
 		imps:  map[string]bool{},
+		sigT:  map[string][]string{},
 	}
 }
 
@@ -101,6 +103,9 @@ func (f *facts) merge(o *facts) {
 	}
 	for k := range o.imps {
 		f.imps[k] = true
+	}
+	for k, v := range o.sigT {
+		f.sigT[k] = v
 	}
 }
 
@@ -225,8 +230,11 @@ func extractFactsToks(toks []string) *facts {
 						}
 						// Method params teach types the same as
 						// plain func params: (s *T) m(w io.Writer).
+						// sigT keys on Type.Method so the arg-slot
+						// goal at s.m(a,| resolves through recv decls;
+						// the bare name is kept as a fallback.
 						if po := nonWS(toks, j+1); atTok(toks, po) == "(" {
-							scanParamList(toks, po, f, "")
+							scanParamList(toks, po, f, rtype+"."+m)
 						}
 						i = j // let the "(" case record the call frame
 						continue
@@ -379,6 +387,13 @@ func extractFactsToks(toks []string) *facts {
 				}
 			case identTok(ty) && !tokenize.IsKeywordish(ty):
 				f.recv[v] = ty
+			default:
+				// Builtin-typed vars are invisible to member lookup
+				// but the arg filler needs them: var timeout int
+				// feeds NewStore(ttl int).
+				if identTok(ty) && builtinType(ty) {
+					f.recv[v] = ty
+				}
 			}
 		case "for":
 			scanRange(toks, i, f)
@@ -463,17 +478,26 @@ func matchBracket(toks []string, open int) int {
 // ends (newline, "=", "{", ",", ";"): for "map[string]*Session" it
 // is Session, for "chan error" it is empty.
 func lastTypeIdent(toks []string, i int) string {
+	s, _ := lastTypeIdentAt(toks, i)
+	return s
+}
+
+// lastTypeIdentAt is lastTypeIdent plus the index where it stopped,
+// so callers can advance the outer scan past the consumed type.
+func lastTypeIdentAt(toks []string, i int) (string, int) {
 	last := ""
+	lastIdx := i
 	for ; i < len(toks); i++ {
 		t := toks[i]
 		if t == tokenize.NL || t == "{" || t == ";" || t == "=" || t == "," {
-			return last
+			return last, lastIdx
 		}
 		if identTok(t) && !builtinType(t) {
 			last = t
+			lastIdx = i
 		}
 	}
-	return last
+	return last, lastIdx
 }
 
 // assignedType records the type of "v := expr" / "v = expr" starting
@@ -737,6 +761,7 @@ func scanParams(toks []string, fi int, f *facts) {
 // declaring function for retT, or empty to skip result recording.
 func scanParamList(toks []string, i int, f *facts, name string) {
 	var pending []string
+	var sig []string
 	depth := 0
 	for ; i < len(toks); i++ {
 		t := toks[i]
@@ -747,6 +772,18 @@ func scanParamList(toks []string, i int, f *facts, name string) {
 		case ")":
 			depth--
 			if depth <= 0 {
+				// Untyped trailing names count as unknown slots.
+				for range pending {
+					sig = append(sig, "")
+				}
+				if name != "" {
+					// Bounded: real signatures stay small, anything
+					// past 32 is a misparse and just wastes space.
+					if len(sig) > 32 {
+						sig = sig[:32]
+					}
+					f.sigT[name] = sig
+				}
 				if rt := resultType(toks, i); rt != "" && identTok(name) {
 					f.retT[name] = rt
 				}
@@ -773,15 +810,24 @@ func scanParamList(toks []string, i int, f *facts, name string) {
 				continue
 			}
 			if nt == ":" {
-				// Annotation style: "u: User", "x: int".
-				ty := atTok(toks, nonWS(toks, j+1))
+				// Annotation style: "u: User", "x: int". Advance i
+				// past the consumed type or it re-enters as a name.
+				tyi := nonWS(toks, j+1)
+				ty := atTok(toks, tyi)
 				if identTok(ty) && !builtinType(ty) {
 					pending = append(pending, t)
 					for _, p := range pending {
 						f.recv[p] = ty
+						sig = append(sig, ty)
 					}
+				} else {
+					for range pending {
+						sig = append(sig, "")
+					}
+					sig = append(sig, "")
 				}
 				pending = pending[:0]
+				i = tyi
 				continue
 			}
 			isElem := false
@@ -803,28 +849,45 @@ func scanParamList(toks []string, i int, f *facts, name string) {
 				// Container param: element type is the last ident
 				// before the next comma or close paren.
 				pending = append(pending, t)
-				if el := lastTypeIdent(toks, j); el != "" {
+				if el, eli := lastTypeIdentAt(toks, j); el != "" {
 					for _, p := range pending {
 						f.elem[p] = el
+						sig = append(sig, nt+":"+el)
+					}
+					i = eli
+				} else {
+					for range pending {
+						sig = append(sig, "")
 					}
 				}
 				pending = pending[:0]
 				continue
 			}
-			if identTok(nt) && !tokenize.IsKeywordish(nt) {
+			if identTok(nt) && (!tokenize.IsKeywordish(nt) || builtinType(nt)) {
+				// Builtin param types count too: NewStore(ttl int)
+				// must know its slot wants an int.
 				pending = append(pending, t)
 				for _, p := range pending {
 					if isElem {
 						f.elem[p] = nt
+						sig = append(sig, "[]"+nt)
 					} else {
 						f.recv[p] = nt
 						if isPtr {
 							f.ptr[p] = true
+							sig = append(sig, "*"+nt)
+						} else {
+							sig = append(sig, nt)
 						}
 					}
 				}
 				pending = pending[:0]
+				i = j // consume the type token so it is not re-read
 			} else {
+				for range pending {
+					sig = append(sig, "")
+				}
+				sig = append(sig, "")
 				pending = pending[:0]
 			}
 		}
@@ -1287,6 +1350,7 @@ type factBuilder struct {
 	tyMem map[string]map[string]int // type -> member -> count
 	callM map[string]map[string]int // func -> member -> count
 	retT  map[string]string         // func -> declared result type
+	sigT  map[string][]string       // func -> ordered param types
 	alias map[string]string         // type alias -> target type
 }
 
@@ -1295,6 +1359,7 @@ func newFactBuilder() *factBuilder {
 		tyMem: map[string]map[string]int{},
 		callM: map[string]map[string]int{},
 		retT:  map[string]string{},
+		sigT:  map[string][]string{},
 		alias: map[string]string{},
 	}
 }
@@ -1313,6 +1378,9 @@ func (fb *factBuilder) Add(toks []string) {
 	}
 	for fn, t := range f.retT {
 		fb.retT[fn] = t
+	}
+	for fn, sig := range f.sigT {
+		fb.sigT[fn] = sig
 	}
 	for a, t := range f.alias {
 		fb.alias[a] = t

@@ -32,6 +32,7 @@ type Config struct {
 	MaxToks    int // max generated tokens
 	CacheOrdr  int
 	CacheCap   int           // session cache token budget
+	CacheRows  int           // max context rows per dynamic cache; 0 = unbounded
 	Budget     time.Duration // per-request latency budget
 	MinProb    float64       // stop generation below this
 	MinProbML  float64       // stricter floor for lines after the first
@@ -83,6 +84,7 @@ func DefaultConfig() Config {
 		MaxToks:    96,
 		CacheOrdr:  3,
 		CacheCap:   2 << 20,
+		CacheRows:  4 << 20,
 		Budget:     30 * time.Millisecond,
 		MinProb:    0.02,
 		MinProbML:  0.05,
@@ -169,6 +171,7 @@ type Engine struct {
 	sessFacts    *facts                              // merged member facts over open docs
 	sessBlocks   map[string][]string                 // merged line -> followers over open docs
 	sessLinePool atomic.Pointer[map[string][]string] // per-lang lines for infix match
+	rawPages     []byte                              // mapped model buffer for the pressure sweep
 
 	// shown tracks the most recent suggestions per (doc, line) so a
 	// Learn can be correlated with what was on screen: matched items
@@ -238,8 +241,8 @@ func New(cfg Config) *Engine {
 		dirs:     make(map[string]*model.Cache),
 		dirTok:   make(map[string]int),
 		learnSet: make(map[string]int),
-		session:  model.NewCache(cfg.CacheOrdr),
-		learned:  model.NewCache(cfg.CacheOrdr),
+		session:  newCacheCap(cfg),
+		learned:  newCacheCap(cfg),
 		shown:    make(map[uint64]shownEnt),
 		rejected: make(map[uint64]rejEnt),
 		shownN:   make(map[string]int),
@@ -260,7 +263,7 @@ func (e *Engine) overlayFor(user string) *userOverlay {
 		return nil
 	}
 	nov := &userOverlay{learnSet: map[string]int{}}
-	nov.cache.Store(model.NewCache(e.cfg.CacheOrdr))
+	nov.cache.Store(e.newCache())
 	v, loaded := e.users.LoadOrStore(user, nov)
 	o := v.(*userOverlay)
 	o.lastUse.Store(time.Now().UnixNano())
@@ -338,6 +341,31 @@ func (e *Engine) SetBundle(b *Bundle) {
 	e.dirSuf = buildDirSuf(b.DirIdents)
 	e.tyMem = b.TypeMem
 	e.callMem = b.CallMem
+	e.rawPages = b.Raw
+}
+
+// newCache makes a dynamic n-gram cache honoring CacheRows.
+func (e *Engine) newCache() *model.Cache {
+	return newCacheCap(e.cfg)
+}
+
+func newCacheCap(cfg Config) *model.Cache {
+	c := model.NewCache(cfg.CacheOrdr)
+	c.SetCap(cfg.CacheRows)
+	return c
+}
+
+// SweepPages advises the kernel to drop mapped model pages not touched
+// since the last sweep. File-backed pages re-fault on next access, so
+// this trades a little cold latency for real RSS relief. Only wired
+// up in low-memory mode.
+func (e *Engine) SweepPages() {
+	e.mu.Lock()
+	raw := e.rawPages
+	e.mu.Unlock()
+	if len(raw) > 0 {
+		madviseDontNeed(raw)
+	}
 }
 
 // buildDirSuf indexes directory paths by their last 1-3 segments so an
@@ -402,7 +430,7 @@ func (e *Engine) InstallDelta(files []DeltaFile) {
 	}
 	// An empty delta still clears the old overlay: a full rebuild may
 	// have folded the changes into the base model.
-	e.delta = model.NewCache(e.cfg.CacheOrdr)
+	e.delta = e.newCache()
 	e.deltaByLang = map[string][]string{}
 	e.deltaFiles = 0
 	e.deltaTok = 0
@@ -740,7 +768,7 @@ func (e *Engine) LearnFor(user, uri, text string, line int) {
 				ov.learnSet[l]++
 			}
 			if ov.toks > e.cfg.CacheCap/4 {
-				ov.cache.Store(model.NewCache(e.cfg.CacheOrdr))
+				ov.cache.Store(e.newCache())
 				ov.learnSet = map[string]int{}
 				ov.toks = 0
 			}
@@ -755,7 +783,7 @@ func (e *Engine) LearnFor(user, uri, text string, line int) {
 		if e.learnTok > e.cfg.CacheCap {
 			// Bound the learned cache like the session cache. The
 			// journal keeps everything regardless.
-			e.learned = model.NewCache(e.cfg.CacheOrdr)
+			e.learned = e.newCache()
 			e.learnTok = 0
 		}
 	} else {
@@ -1091,7 +1119,7 @@ func (e *Engine) drainOnce() bool {
 		var c *model.Cache
 		if e.m != nil {
 			ids = e.internToks(tokenize.Lex([]byte(t.text)))
-			c = model.NewCache(e.cfg.CacheOrdr)
+			c = e.newCache()
 			c.Add(ids, e.eofID)
 		}
 		bs = append(bs, built{t, ids, c, docLines(t.text),
@@ -1138,19 +1166,19 @@ func (e *Engine) drainOnce() bool {
 	for _, b := range live {
 		e.sessTok += len(b.ids)
 		if e.sessTok > e.cfg.CacheCap {
-			e.session = model.NewCache(e.cfg.CacheOrdr)
+			e.session = e.newCache()
 			e.sessTok = 0
 		}
 		adds = append(adds, cacheAdd{e.session, b.ids})
 		if dir := dirOfURI(b.uri); dir != "" && (len(e.dirs) < 64 || e.dirs[dir] != nil) {
 			c := e.dirs[dir]
 			if c == nil {
-				c = model.NewCache(e.cfg.CacheOrdr)
+				c = e.newCache()
 				e.dirs[dir] = c
 			}
 			e.dirTok[dir] += len(b.ids)
 			if e.dirTok[dir] > e.cfg.CacheCap/4 {
-				e.dirs[dir] = model.NewCache(e.cfg.CacheOrdr)
+				e.dirs[dir] = e.newCache()
 				e.dirTok[dir] = 0
 				c = e.dirs[dir]
 			}
@@ -1916,6 +1944,7 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 		// (error sentinels, the file's own literals).
 		var memNames map[string]bool
 		var pf *facts
+		var preToks []string
 		lineIndent := leadingWS(linePrefix)
 		if dis&fMem == 0 {
 			pstart := 0
@@ -1925,7 +1954,8 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 					pstart++
 				}
 			}
-			pf = extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
+			preToks = tokenize.Lex([]byte(prefix[pstart:]))
+			pf = extractFactsToks(preToks)
 			chain, call, indexed, isDot := dotChain(linePrefix)
 			var mems []string
 			var memLocal map[string]bool
@@ -1982,6 +2012,43 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 						sc = w.Dyn * 0.5 // literal fallbacks rank softer
 					}
 					items = append(items, mk(c, "mem", sc))
+				}
+			}
+			// Type-directed assembly: when the cursor demands a known
+			// type, compose the expression from producers instead of
+			// predicting tokens. var T =, x =, return, f(a,, T{F:.
+			if g := goalAt(linePrefix, preToks, pf, e.sessFacts); g.name != "" {
+				tyTabs, _, _ := e.memberTabs()
+				var pool []string
+				if p := e.sessLinePool.Load(); p != nil {
+					pool = (*p)[lang]
+				}
+				var cRet map[string]string
+				var cSig map[string][]string
+				if a := e.aux.Load(); a != nil {
+					cRet, cSig = a.retT, a.sigT
+				}
+				synthL, synthC := synthExpr(g, pf, e.sessFacts, tyTabs, pool, cRet, cSig)
+				for i, list := range [][]string{synthL, synthC} {
+					// Session-local producers rank over corpus ones:
+					// name collisions make every same-named corpus
+					// type claim every ctor.
+					sc := w.Dyn * 1.8
+					if i == 1 {
+						sc = w.Dyn * 1.1
+					}
+					for _, c := range list {
+						ok := e.accept(c, ns, restN)
+						if !ok && len(c) < e.cfg.MinLen {
+							// Synthesis only emits attested names; a one
+							// char var is a real answer, not junk.
+							ok = isIdentText(c)
+						}
+						if ok && !seen[c] {
+							seen[c] = true
+							items = append(items, mk(c, "synth", sc))
+						}
+					}
 				}
 			}
 		}
