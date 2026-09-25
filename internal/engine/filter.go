@@ -372,7 +372,12 @@ func argSynthesis(linePrefix string, scope, sessDecls, docDecls map[string]bool,
 					if t != elemT || v == firstArg {
 						continue
 					}
+					// Pointer vars go in as *v: an []Entry wants the
+					// element, and e *Entry dereferences to it.
 					c := " " + v + ")"
+					if f.ptr[v] {
+						c = " *" + v + ")"
+					}
 					dup := false
 					for _, o := range out {
 						if o == c {

@@ -25,6 +25,7 @@ type facts struct {
 	callM map[string]map[string]int    // func name -> member invoked on its result
 	retT  map[string]string            // func or method name -> first non-builtin result type
 	alias map[string]string            // type A = B / type A B where B is a named type
+	ptr   map[string]bool              // vars whose declared type is a pointer: recv strips *
 	decls map[string]bool              // top-level declared names (var/const/type/func)
 }
 
@@ -37,6 +38,7 @@ func newFacts() *facts {
 		callM: map[string]map[string]int{},
 		retT:  map[string]string{},
 		alias: map[string]string{},
+		ptr:   map[string]bool{},
 		decls: map[string]bool{},
 	}
 }
@@ -88,6 +90,9 @@ func (f *facts) merge(o *facts) {
 	}
 	for k, v := range o.alias {
 		f.alias[k] = v
+	}
+	for k := range o.ptr {
+		f.ptr[k] = true
 	}
 	for d := range o.decls {
 		f.decls[d] = true
@@ -197,6 +202,12 @@ func extractFactsToks(toks []string) *facts {
 				if rtype != "" {
 					if rname != "" {
 						f.recv[rname] = rtype
+						// (r *T) receivers are pointers.
+						for ri := j + 1; ri < end; ri++ {
+							if toks[ri] == "*" {
+								f.ptr[rname] = true
+							}
+						}
 					}
 					j = nonWS(toks, end+1)
 					if m := atTok(toks, j); identTok(m) &&
@@ -206,6 +217,11 @@ func extractFactsToks(toks []string) *facts {
 							if rt := resultType(toks, pe); rt != "" {
 								f.retT[m] = rt
 							}
+						}
+						// Method params teach types the same as
+						// plain func params: (s *T) m(w io.Writer).
+						if po := nonWS(toks, j+1); atTok(toks, po) == "(" {
+							scanParamList(toks, po, f, "")
 						}
 						i = j // let the "(" case record the call frame
 						continue
@@ -282,10 +298,17 @@ func extractFactsToks(toks []string) *facts {
 				f.assignedType(v, toks, k)
 				continue
 			}
+			isPtr := false
 			if atTok(toks, k) == "*" {
 				k = nonWS(toks, k+1)
+				isPtr = true
 			}
 			ty := atTok(toks, k)
+			if isPtr && identTok(ty) && !tokenize.IsKeywordish(ty) {
+				f.recv[v] = ty
+				f.ptr[v] = true
+				continue
+			}
 			switch {
 			case ty == "[":
 				// var s []T: container, record the element type.
@@ -409,6 +432,7 @@ func (f *facts) assignedType(v string, toks []string, k int) {
 	case "&", "new":
 		if ty := atTok(toks, nonWS(toks, k+1)); identTok(ty) && !builtinType(ty) {
 			f.recv[v] = ty
+			f.ptr[v] = true
 		}
 		return
 	case "[":
@@ -644,7 +668,6 @@ func scanParams(toks []string, fi int, f *facts) {
 	if atTok(toks, i) == "(" {
 		return // method decl: recvDecl handles it
 	}
-	name := atTok(toks, i)
 	// Skip the name (and generics bracket) to the parameter opener.
 	for i < len(toks) && atTok(toks, i) != "(" && toks[i] != tokenize.NL {
 		i++
@@ -652,6 +675,13 @@ func scanParams(toks []string, fi int, f *facts) {
 	if i >= len(toks) || atTok(toks, i) != "(" {
 		return
 	}
+	scanParamList(toks, i, f, atTok(toks, nonWS(toks, fi+1)))
+}
+
+// scanParamList walks the parameter tokens starting at the opening
+// paren index i. Used for plain funcs and methods alike; name is the
+// declaring function for retT, or empty to skip result recording.
+func scanParamList(toks []string, i int, f *facts, name string) {
 	var pending []string
 	depth := 0
 	for ; i < len(toks); i++ {
@@ -709,9 +739,11 @@ func scanParams(toks []string, fi int, f *facts) {
 					isElem = true
 				}
 			}
+			isPtr := false
 			if nt == "*" {
 				j = nonWS(toks, j+1)
 				nt = atTok(toks, j)
+				isPtr = true
 			}
 			if nt == "map" || nt == "chan" {
 				// Container param: element type is the last ident
@@ -732,6 +764,9 @@ func scanParams(toks []string, fi int, f *facts) {
 						f.elem[p] = nt
 					} else {
 						f.recv[p] = nt
+						if isPtr {
+							f.ptr[p] = true
+						}
 					}
 				}
 				pending = pending[:0]
@@ -804,9 +839,9 @@ func scanStructFields(toks []string, open int, typ string, f *facts) int {
 // ["s","st"], "st." gives ["st"]. Resolution order per step: doc
 // facts, then session facts, then corpus tables. tyMems carries the
 // static tables: the base model plus any aux overlay, oldest first.
-func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[string][]string, auxAlias map[string]string) (mems []string, corpusOnly bool) {
+func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[string][]string, auxAlias map[string]string) (mems []string, local map[string]bool, corpusOnly bool) {
 	if len(chain) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	typ := ""
 	if indexed {
@@ -824,7 +859,7 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[str
 	}
 	for _, link := range chain[1:] {
 		if typ == "" {
-			return nil, false
+			return nil, nil, false
 		}
 		nt := ""
 		for _, f := range []*facts{doc, sess} {
@@ -845,40 +880,51 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[str
 		typ = nt
 	}
 	if typ == "" {
-		return nil, false
+		return nil, nil, false
 	}
-	// Alias chase: bounded, so alias loops terminate. Facts cover the
-	// session; the aux overlay covers corpus aliases.
-	for hop := 0; hop < 4; hop++ {
-		nt := auxAlias[typ]
+	// Alias chase: collect the type AND its alias targets - an alias
+	// widens the member set, it never replaces it. A corpus
+	// "type Entry = X" must not redirect a session type named Entry
+	// into X's members.
+	types := []string{typ}
+	seenT := map[string]bool{typ: true}
+	for hop := 0; hop < 4 && len(types) < 8; hop++ {
+		cur := types[len(types)-1]
+		nt := auxAlias[cur]
 		for _, f := range []*facts{doc, sess} {
-			if f != nil && f.alias[typ] != "" {
-				nt = f.alias[typ]
+			if f != nil && f.alias[cur] != "" {
+				nt = f.alias[cur]
 				break
 			}
 		}
-		if nt == "" || nt == typ {
+		if nt == "" || seenT[nt] {
 			break
 		}
-		typ = nt
+		seenT[nt] = true
+		types = append(types, nt)
 	}
 	seen := map[string]bool{}
 	var out []string
+	localSet := map[string]bool{} // doc/session members: provenance for scoring
 	add := func(m string) {
 		if !seen[m] {
 			seen[m] = true
 			out = append(out, m)
 		}
 	}
+	addLocal := func(m string) {
+		localSet[m] = true
+		add(m)
+	}
 	collect := func(t string) {
 		if doc != nil {
 			for m := range doc.tyMem[t] {
-				add(m)
+				addLocal(m)
 			}
 		}
 		if sess != nil {
 			for m := range sess.tyMem[t] {
-				add(m)
+				addLocal(m)
 			}
 		}
 		for _, tab := range tyMems {
@@ -887,7 +933,9 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[str
 			}
 		}
 	}
-	collect(typ)
+	for _, t := range types {
+		collect(t)
+	}
 	// Embedded fields promote: "type A struct { B }" offers B's
 	// methods on a. directly. One hop is enough for ranking.
 	for _, f := range []*facts{doc, sess} {
@@ -913,14 +961,31 @@ func membersFor(chain []string, indexed bool, doc, sess *facts, tyMems []map[str
 			}
 		}
 	}
-	nSess := 0
+	// corpusOnly means no session facts contributed the base type.
+	corpusOnly = true
 	for _, f := range []*facts{doc, sess} {
-		if f != nil {
-			nSess += len(f.tyMem[typ])
+		if f == nil {
+			continue
+		}
+		for _, t := range types {
+			if len(f.tyMem[t]) > 0 {
+				corpusOnly = false
+			}
 		}
 	}
-	sortMembers(out)
-	return out, nSess == 0 && len(out) > 0
+	// Sort session members first among themselves, corpus after.
+	var loc, corp []string
+	for _, m := range out {
+		if localSet[m] {
+			loc = append(loc, m)
+		} else {
+			corp = append(corp, m)
+		}
+	}
+	sortMembers(loc)
+	sortMembers(corp)
+	mems = append(loc, corp...)
+	return mems, localSet, corpusOnly
 }
 
 // sortMembers orders member continuations: method calls first (they

@@ -266,7 +266,7 @@ type Worker struct {
 func (w *Worker) tick() {
 }
 `)))
-	mems, _ := membersFor(chain, true, f, nil, nil, nil)
+	mems, _, _ := membersFor(chain, true, f, nil, nil, nil)
 	var got []string
 	for _, m := range mems {
 		got = append(got, m)
@@ -367,7 +367,7 @@ func x() {
 	if !ok || !indexed || len(chain) != 1 {
 		t.Fatalf("dotChain: %v %v %v", chain, indexed, ok)
 	}
-	mems, _ := membersFor(chain, indexed, f, nil, nil, nil)
+	mems, _, _ := membersFor(chain, indexed, f, nil, nil, nil)
 	if len(mems) == 0 || mems[0] != "Token" {
 		t.Fatalf("map index members wrong: %v", mems)
 	}
@@ -450,7 +450,7 @@ u.`)))
 	if !ok {
 		t.Fatal("dotChain failed")
 	}
-	mems, _ := membersFor(chain, false, ts, nil, nil, nil)
+	mems, _, _ := membersFor(chain, false, ts, nil, nil, nil)
 	if len(mems) == 0 {
 		t.Fatal("no members for annotated u")
 	}
@@ -639,5 +639,60 @@ func TestNextEditHints(t *testing.T) {
 		if strings.Contains(h.Old, "items") {
 			t.Fatalf("hint on clean doc: %v", h)
 		}
+	}
+}
+
+func TestMemberProvenanceSplit(t *testing.T) {
+	// Session members must rank ahead of same-named corpus type's
+	// members: the local Entry wins over every other corpus Entry.
+	e := buildEngine(t, DefaultConfig())
+	e.SetAux(&AuxData{TypeMem: map[string][]string{
+		"Entry": {"Info(", "ObjectOf(", "PkgNameOf(", "Zonk("},
+	}})
+	e.UpdateDoc("file:///s.go", `package q
+
+type Entry struct {
+	Key     string
+	Value   []byte
+}
+
+func show(e *Entry) {
+	_ = e.
+}`)
+	e.Flush()
+	text := "package q\n\ntype Entry struct {\n\tKey     string\n\tValue   []byte\n}\n\nfunc show(e *Entry) {\n\t_ = e."
+	items := e.Complete("file:///s.go", text, len(text))
+	top := texts(items)
+	var keyIdx, infoIdx = -1, -1
+	for i, s := range top {
+		if s == "Key" || s == "Key]" || strings.HasPrefix(s, "Key") {
+			keyIdx = i
+		}
+		if strings.HasPrefix(s, "Info(") {
+			infoIdx = i
+		}
+	}
+	if keyIdx < 0 {
+		t.Fatalf("session member Key missing: %v", top)
+	}
+	if infoIdx >= 0 && infoIdx < keyIdx {
+		t.Fatalf("corpus member outranked session member: %v", top)
+	}
+}
+
+func TestAppendPointerElem(t *testing.T) {
+	e := buildEngine(t, DefaultConfig())
+	e.UpdateDoc("file:///ap2.go", `package q
+
+type Entry struct{ K string }
+
+func f(items []Entry, e *Entry) {
+	items = append(items,
+}`)
+	e.Flush()
+	text := "package q\n\ntype Entry struct{ K string }\n\nfunc f(items []Entry, e *Entry) {\n\titems = append(items,"
+	items := e.Complete("file:///ap2.go", text, len(text))
+	if !hasText(items, " *e)") {
+		t.Fatalf("want *e) for ptr elem, got %v", texts(items))
 	}
 }

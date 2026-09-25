@@ -1826,25 +1826,26 @@ func (e *Engine) CompleteFor(user, uri, text string, offset int) (items []Item) 
 			pf := extractFactsToks(tokenize.Lex([]byte(prefix[pstart:])))
 			chain, call, indexed, isDot := dotChain(linePrefix)
 			var mems []string
-			corpOnly := false
+			var memLocal map[string]bool
 			if isDot {
 				tyTabs, callTabs, auxAlias := e.memberTabs()
 				if call != "" {
 					mems = callMembers(call, pf, e.sessFacts, tyTabs, callTabs)
 				} else {
-					mems, corpOnly = membersFor(chain, indexed, pf, e.sessFacts, tyTabs, auxAlias)
+					mems, memLocal, _ = membersFor(chain, indexed, pf, e.sessFacts, tyTabs, auxAlias)
 				}
 				for _, m := range mems {
 					if ok := e.accept(m, ns, restN); ok && !seen[m] {
 						seen[m] = true
 						sc := w.Dyn * 2
-						if corpOnly {
+						if !memLocal[m] {
 							// Corpus members come from name collisions
 							// too: every File in the world claims its
 							// methods. Bias toward names the corpus
 							// uses often so Close beats a one-off
-							// exotic member from some other File.
-							sc = w.Dyn * 1.5
+							// exotic member from some other File, and
+							// session members always outrank.
+							sc = w.Dyn * 0.9
 							if e.m != nil {
 								base := strings.TrimSuffix(m, "(")
 								if id, ok := e.m.Vocab.Lookup(" " + base); ok && int(id) < len(e.m.Uni) {
